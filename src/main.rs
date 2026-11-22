@@ -881,7 +881,7 @@ impl Ids {
                 }
             }
             probes += 1;
-            if probes > 2048 {
+            if probes > 512 {
                 self.overflow.store(true, Relaxed);
                 return (0, false);
             }
@@ -943,24 +943,22 @@ fn build_links(ids: &Ids, link_chunks: &[&'static [u8]], nthreads: usize) {
     let best: &'static [AtomicU32] = zeroed::<AtomicU32>(cap);
     let next = AtomicUsize::new(0);
     let mut inserted: Vec<Vec<u32>> = Vec::new();
+    const LB: usize = 32;
     std::thread::scope(|s| {
         let hs: Vec<_> = (0..nthreads)
             .map(|_| {
                 let next = &next;
                 s.spawn(move || {
                     let mut mine: Vec<u32> = Vec::new();
-                    loop {
-                        let j = next.fetch_add(1, Relaxed);
-                        if j >= link_chunks.len() {
-                            break;
-                        }
-                        for_each_line(link_chunks[j], |line| {
-                            let mut f: [&'static [u8]; 2] = [&[]; 2];
-                            if !split_line(line, &mut f) || f[0].is_empty() || f[1].is_empty() {
-                                return;
-                            }
-                            let (a, ia) = ids.intern(hash_bytes(f[0]), mkref(f[0].as_ptr(), f[0].len()));
-                            let (b, ib) = ids.intern(hash_bytes(f[1]), mkref(f[1].as_ptr(), f[1].len()));
+                    let mut flat = Flat::new();
+                    // batches: hash + prefetch slots, then intern + prefetch parents, then union
+                    let mut batch: Vec<(u64, u64, u64, u64)> = Vec::with_capacity(LB);
+                    let mut pairs: Vec<(u32, u32)> = Vec::with_capacity(LB);
+                    let mut flush = |batch: &mut Vec<(u64, u64, u64, u64)>, mine: &mut Vec<u32>| {
+                        pairs.clear();
+                        for &(ha, ra, hb, rb) in batch.iter() {
+                            let (a, ia) = ids.intern(ha, ra);
+                            let (b, ib) = ids.intern(hb, rb);
                             if ia {
                                 mine.push(a);
                             }
@@ -968,10 +966,40 @@ fn build_links(ids: &Ids, link_chunks: &[&'static [u8]], nthreads: usize) {
                                 mine.push(b);
                             }
                             if a != b {
-                                uf_union(parent, a, b);
+                                unsafe {
+                                    _mm_prefetch(parent.as_ptr().add(a as usize) as *const i8, _MM_HINT_T0);
+                                    _mm_prefetch(parent.as_ptr().add(b as usize) as *const i8, _MM_HINT_T0);
+                                }
+                                pairs.push((a, b));
                             }
-                        });
+                        }
+                        for &(a, b) in pairs.iter() {
+                            uf_union(parent, a, b);
+                        }
+                        batch.clear();
+                    };
+                    loop {
+                        let j = next.fetch_add(1, Relaxed);
+                        if j >= link_chunks.len() {
+                            break;
+                        }
+                        unsafe {
+                            for_lines::<2>(&mut flat, link_chunks[j], |fp, fl| {
+                                if fl[0] == 0 || fl[1] == 0 {
+                                    return;
+                                }
+                                let ha = hash_ptr(fp[0], fl[0]);
+                                let hb = hash_ptr(fp[1], fl[1]);
+                                _mm_prefetch(ids.slot_ptr(ha) as *const i8, _MM_HINT_T0);
+                                _mm_prefetch(ids.slot_ptr(hb) as *const i8, _MM_HINT_T0);
+                                batch.push((ha, mkref(fp[0], fl[0]), hb, mkref(fp[1], fl[1])));
+                                if batch.len() == LB {
+                                    flush(&mut batch, &mut mine);
+                                }
+                            });
+                        }
                     }
+                    flush(&mut batch, &mut mine);
                     mine
                 })
             })
@@ -984,10 +1012,24 @@ fn build_links(ids: &Ids, link_chunks: &[&'static [u8]], nthreads: usize) {
         return;
     }
     let name = |i: u32| deref(ids.prefs[i as usize].load(Relaxed));
+    const PD: usize = 8;
     std::thread::scope(|s| {
         for v in &inserted {
             s.spawn(move || {
-                for &i in v {
+                for (k, &i) in v.iter().enumerate() {
+                    if k + PD < v.len() {
+                        let j = v[k + PD] as usize;
+                        unsafe {
+                            _mm_prefetch(parent.as_ptr().add(j) as *const i8, _MM_HINT_T0);
+                            _mm_prefetch(ids.prefs.as_ptr().add(j) as *const i8, _MM_HINT_T0);
+                        }
+                    }
+                    if k + PD / 2 < v.len() {
+                        let r = ids.prefs[v[k + PD / 2] as usize].load(Relaxed);
+                        unsafe {
+                            _mm_prefetch((r & 0xFFFF_FFFF_FFFF) as *const i8, _MM_HINT_T0);
+                        }
+                    }
                     let r = uf_find(parent, i) as usize;
                     let my = name(i);
                     loop {
@@ -1006,7 +1048,14 @@ fn build_links(ids: &Ids, link_chunks: &[&'static [u8]], nthreads: usize) {
     std::thread::scope(|s| {
         for v in &inserted {
             s.spawn(move || {
-                for &i in v {
+                for (k, &i) in v.iter().enumerate() {
+                    if k + PD < v.len() {
+                        let j = v[k + PD] as usize;
+                        unsafe {
+                            _mm_prefetch(parent.as_ptr().add(j) as *const i8, _MM_HINT_T0);
+                            _mm_prefetch(ids.slots.as_ptr().add(j) as *const i8, _MM_HINT_T0);
+                        }
+                    }
                     let r = uf_find(parent, i) as usize;
                     let b = best[r].load(Relaxed) - 1;
                     if b != i {
@@ -1651,6 +1700,34 @@ fn main() {
     let base = ws - WEEK;
     assert!(we - base < u32::MAX as i64 - 1, "window too long");
 
+    // products / campaigns: parsed on a side thread while files are mapped and links are joined
+    let pc_dir = data_dir.clone();
+    let mut pc_handle = Some(std::thread::spawn(move || {
+        let prows = read_small_csv(&pc_dir.join("products.csv"));
+        let mut cat_names: Vec<Vec<u8>> = prows.iter().map(|r| r.1.clone()).collect();
+        cat_names.push(b"unknown".to_vec());
+        cat_names.sort();
+        cat_names.dedup();
+        assert!(cat_names.len() <= 255, "too many categories");
+        let mut products = Lookup::new(b"p");
+        for (pid, cat) in &prows {
+            let c = cat_names.binary_search(cat).unwrap() as u32;
+            products.insert(pid, c);
+        }
+        let unknown_cat = cat_names.binary_search(&b"unknown".to_vec()).unwrap() as u32;
+        let crows = read_small_csv(&pc_dir.join("campaigns.csv"));
+        let mut campaigns = Lookup::new(b"c_");
+        for (i, (cid, _)) in crows.iter().enumerate() {
+            campaigns.insert(cid, i as u32);
+        }
+        (cat_names, products, unknown_cat, crows, campaigns)
+    }));
+    let mut cat_names: Vec<Vec<u8>> = Vec::new();
+    let mut products = Lookup::new(b"p");
+    let mut unknown_cat = 0u32;
+    let mut crows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut campaigns = Lookup::new(b"c_");
+
     // files (mapped in parallel)
     let ev_paths = csv_files(&data_dir.join("events"));
     let ck_paths = csv_files(&data_dir.join("clicks"));
@@ -1687,25 +1764,6 @@ fn main() {
     let ln_files: Vec<&'static [u8]> = (0..ln_paths.len()).map(|j| file_at(ev_paths.len() + ck_paths.len() + j)).collect();
     lap("mapped");
 
-    // products / campaigns
-    let prows = read_small_csv(&data_dir.join("products.csv"));
-    let mut cat_names: Vec<Vec<u8>> = prows.iter().map(|r| r.1.clone()).collect();
-    cat_names.push(b"unknown".to_vec());
-    cat_names.sort();
-    cat_names.dedup();
-    assert!(cat_names.len() <= 255, "too many categories");
-    let mut products = Lookup::new(b"p");
-    for (pid, cat) in &prows {
-        let c = cat_names.binary_search(cat).unwrap() as u32;
-        products.insert(pid, c);
-    }
-    let unknown_cat = cat_names.binary_search(&b"unknown".to_vec()).unwrap() as u32;
-    let crows = read_small_csv(&data_dir.join("campaigns.csv"));
-    let mut campaigns = Lookup::new(b"c_");
-    for (i, (cid, _)) in crows.iter().enumerate() {
-        campaigns.insert(cid, i as u32);
-    }
-    let ncamp = crows.len();
     let first_day = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - first_day + 1).max(1) as usize;
 
@@ -1738,9 +1796,19 @@ fn main() {
     let mut grow = 1usize;
     loop {
         // ID table sized for linked IDs plus the users seen only in events
-        let est_ids = link_bytes / 10 + est_rows / 25 + 4096;
-        let ids = Ids::new(est_ids * 2 * grow);
+        // ~26-byte link lines, each ID in ~1.5 of them; plus users seen only in events
+        let est_ids = link_bytes / 20 + est_rows / 60 + 4096;
+        let ids = Ids::new(est_ids * 3 / 2 * grow);
         build_links(&ids, &link_chunks, nthreads);
+        if let Some(h) = pc_handle.take() {
+            let r = h.join().unwrap();
+            cat_names = r.0;
+            products = r.1;
+            unknown_cat = r.2;
+            crows = r.3;
+            campaigns = r.4;
+        }
+        let ncamp = crows.len();
         lap("links");
         let pshift = ids.bits.saturating_sub(NPB.trailing_zeros());
         let npb = 1usize << (ids.bits - pshift);
@@ -1815,6 +1883,7 @@ fn main() {
                     s.spawn(move || {
                         let mut keys: Vec<u64> = Vec::new();
                         let mut vals: Vec<u64> = Vec::new();
+                        let mut used: Vec<u32> = Vec::new();
                         let mark = |rowid: u32| {
                             let t = (rowid >> 27) as usize;
                             let i = (rowid & ((1 << 27) - 1)) as usize;
@@ -1828,9 +1897,12 @@ fn main() {
                             let total: usize = outs.iter().map(|o| o.dk.len(b)).sum();
                             let cap = (total * 2).next_power_of_two().max(16);
                             let mask = cap - 1;
-                            keys.clear();
-                            keys.resize(cap, 0);
-                            vals.resize(cap, 0);
+                            if keys.len() < cap {
+                                // grow (fresh zeroed memory); otherwise reuse: only used slots are dirty
+                                keys = vec![0; cap];
+                                vals = vec![0; cap];
+                            }
+                            used.clear();
                             for o in outs.iter() {
                                 for part in [o.dk.main(b), o.dk.spilled(b)] {
                                     for r in part.iter() {
@@ -1843,6 +1915,7 @@ fn main() {
                                                     *keys.get_unchecked_mut(p) = r.ehash;
                                                     *vals.get_unchecked_mut(p) = v;
                                                 }
+                                                used.push(p as u32);
                                                 break;
                                             }
                                             if k == r.ehash {
@@ -1858,6 +1931,11 @@ fn main() {
                                             p = (p + 1) & mask;
                                         }
                                     }
+                                }
+                            }
+                            for &p in used.iter() {
+                                unsafe {
+                                    *keys.get_unchecked_mut(p as usize) = 0;
                                 }
                             }
                         }
