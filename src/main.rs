@@ -1594,15 +1594,14 @@ impl<T: Copy + 'static> Buckets<T> {
     fn push_ref(&mut self, b: usize, v: T) -> u32 {
         unsafe {
             let c = self.cur.get_unchecked_mut(b);
-            let p = c[0];
-            if p < c[1] {
-                *p = v;
-                c[0] = p.add(1);
-                *self.rend.get_unchecked(b) - c[1].offset_from(p) as u32
-            } else {
-                self.refill(b, v);
-                *self.rend.get_unchecked(b) - self.ch as u32
+            if c[0] >= c[1] {
+                self.refill(b);
             }
+            let c = self.cur.get_unchecked_mut(b);
+            let p = c[0];
+            *p = v;
+            c[0] = p.add(1);
+            *self.rend.get_unchecked(b) - c[1].offset_from(p) as u32
         }
     }
     /// The record of a ref from `push_ref` (without its tag).
@@ -1612,20 +1611,23 @@ impl<T: Copy + 'static> Buckets<T> {
     }
     #[inline(always)]
     fn push(&mut self, b: usize, v: T) {
+        // (the record does not go to the cold refill: passed by reference, it would go
+        // through the stack, and a 12-byte record stored as u32s then loaded as a u64
+        // stalls on store forwarding)
         unsafe {
             let c = self.cur.get_unchecked_mut(b);
-            let p = c[0];
-            if p < c[1] {
-                *p = v;
-                c[0] = p.add(1);
-            } else {
-                self.refill(b, v);
+            if c[0] >= c[1] {
+                self.refill(b);
             }
+            let c = self.cur.get_unchecked_mut(b);
+            let p = c[0];
+            *p = v;
+            c[0] = p.add(1);
         }
     }
     #[cold]
     #[inline(never)]
-    fn refill(&mut self, b: usize, v: T) {
+    fn refill(&mut self, b: usize) {
         unsafe {
             if self.left == 0 {
                 self.next = zeroed::<T>(self.arena * self.ch).as_mut_ptr();
@@ -1635,8 +1637,7 @@ impl<T: Copy + 'static> Buckets<T> {
             self.next = s.add(self.ch);
             self.left -= 1;
             self.chunks[b].push(s);
-            *s = v;
-            self.cur[b] = [s.add(1), s.add(self.ch)];
+            self.cur[b] = [s, s.add(self.ch)];
             if self.ch == 1024 {
                 assert!(self.all.len() < (1 << 17) - 1, "too many chunks");
                 self.rend[b] = self.tag | ((self.all.len() as u32) << 10) + 1024;
