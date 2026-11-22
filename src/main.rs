@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering:
 use std::time::Instant;
 
 mod parquet;
+use parquet::{Col, Data, Kind};
 
 const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
@@ -25,9 +26,7 @@ const PROT_WRITE: i32 = 2;
 const MAP_PRIVATE: i32 = 2;
 const MAP_FIXED: i32 = 0x10;
 const MAP_ANON: i32 = 0x20;
-const MAP_POPULATE: i32 = 0x8000;
 const MADV_HUGEPAGE: i32 = 14;
-const MADV_WILLNEED: i32 = 3;
 
 /// Maps a file read-only with at least one zero page after it, so SIMD loads may run past the end.
 fn map_file(path: &Path) -> &'static [u8] {
@@ -42,7 +41,7 @@ fn map_file(path: &Path) -> &'static [u8] {
         if base as isize == -1 {
             panic!("mmap anon failed");
         }
-        let p = mmap(base, len, PROT_READ, MAP_PRIVATE | MAP_FIXED | MAP_POPULATE, f.as_raw_fd(), 0);
+        let p = mmap(base, len, PROT_READ, MAP_PRIVATE | MAP_FIXED, f.as_raw_fd(), 0);
         if p as isize == -1 || p != base {
             panic!("mmap failed for {}", path.display());
         }
@@ -1282,18 +1281,31 @@ unsafe fn parse_clicks(ctx: &Ctx, chunk: &'static [u8], out: &mut ThreadOut) {
 
 struct UserDaily {
     n: usize,
-    uid: Vec<u8>,
-    day: Vec<u8>,
-    sessions: Vec<u8>,
-    events: Vec<u8>,
-    revenue: Vec<u8>,
+    names: Vec<u8>, // PLAIN byte arrays, one per person (rows of a person are contiguous)
+    nnames: u32,
+    uidx: Vec<u32>,
+    day: Vec<u32>, // day index from first_day
+    sessions: Vec<u64>,
+    events: Vec<u64>,
+    revenue: Vec<u64>,
     top_def: Vec<u8>,
-    top_val: Vec<u8>,
+    top_idx: Vec<u32>,
 }
 
 impl UserDaily {
-    fn new() -> Self {
-        UserDaily { n: 0, uid: Vec::new(), day: Vec::new(), sessions: Vec::new(), events: Vec::new(), revenue: Vec::new(), top_def: Vec::new(), top_val: Vec::new() }
+    fn new(rows: usize) -> Self {
+        UserDaily {
+            n: 0,
+            names: Vec::with_capacity(rows * 8),
+            nnames: 0,
+            uidx: Vec::with_capacity(rows),
+            day: Vec::with_capacity(rows),
+            sessions: Vec::with_capacity(rows),
+            events: Vec::with_capacity(rows),
+            revenue: Vec::with_capacity(rows),
+            top_def: Vec::with_capacity(rows),
+            top_idx: Vec::with_capacity(rows / 8),
+        }
     }
 }
 
@@ -1460,6 +1472,8 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
         let clicks = w.ck.get_unchecked(cs..ce);
         let nc = clicks.len();
         let name = deref(prefs.get_unchecked(lo_pid as usize + p).load(Relaxed));
+        put_str(&mut ud.names, name);
+        ud.nnames += 1;
         let n = evs.len();
         let mut lo = 0usize;
         let mut hi = 0usize;
@@ -1477,7 +1491,7 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
             let day = (base + start as i64).div_euclid(DAY);
             if day != cur_day {
                 if cur_day != i64::MIN {
-                    flush_day(ud, name, cur_day, d_sessions, d_events, d_rev, d_purch, &mut w.cat_sum, cat_names);
+                    flush_day(ud, (cur_day - ctx.first_day) as u32, d_sessions, d_events, d_rev, d_purch, &mut w.cat_sum, cat_names);
                 }
                 cur_day = day;
                 d_sessions = 0;
@@ -1564,19 +1578,19 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
             *w.wcnt.get_unchecked_mut(c as usize) = 0;
         }
         w.active.clear();
-        flush_day(ud, name, cur_day, d_sessions, d_events, d_rev, d_purch, &mut w.cat_sum, cat_names);
+        flush_day(ud, (cur_day - ctx.first_day) as u32, d_sessions, d_events, d_rev, d_purch, &mut w.cat_sum, cat_names);
     }
     TM[2].fetch_add(tq.elapsed().as_nanos() as u64, Relaxed);
 }
 
 #[inline]
-fn flush_day(ud: &mut UserDaily, name: &[u8], day: i64, sessions: i64, events: i64, rev: i64, purch: bool, cat_sum: &mut [u64], cat_names: &[Vec<u8>]) {
+fn flush_day(ud: &mut UserDaily, dayidx: u32, sessions: i64, events: i64, rev: i64, purch: bool, cat_sum: &mut [u64], _cat_names: &[Vec<u8>]) {
     ud.n += 1;
-    put_str(&mut ud.uid, name);
-    ud.day.extend_from_slice(&(day as i32).to_le_bytes());
-    ud.sessions.extend_from_slice(&sessions.to_le_bytes());
-    ud.events.extend_from_slice(&events.to_le_bytes());
-    ud.revenue.extend_from_slice(&rev.to_le_bytes());
+    ud.uidx.push(ud.nnames - 1);
+    ud.day.push(dayidx);
+    ud.sessions.push(sessions as u64);
+    ud.events.push(events as u64);
+    ud.revenue.push(rev as u64);
     if purch {
         let mut best = 0usize;
         let mut bv = 0u64;
@@ -1588,7 +1602,7 @@ fn flush_day(ud: &mut UserDaily, name: &[u8], day: i64, sessions: i64, events: i
             *v = 0;
         }
         ud.top_def.push(1);
-        put_str(&mut ud.top_val, &cat_names[best]);
+        ud.top_idx.push(best as u32);
     } else {
         ud.top_def.push(0);
     }
@@ -1882,7 +1896,7 @@ fn main() {
                         ev: Vec::new(),
                         ck: Vec::new(),
                     };
-                    let mut ud = UserDaily::new();
+                    let mut ud = UserDaily::new(est_rows / 9 / nthreads + 1024);
                     loop {
                         let j = next.fetch_add(1, Relaxed);
                         if j >= npb {
@@ -1916,6 +1930,17 @@ fn main() {
                 }
             }
         }
+        let mut day_dict_v: Vec<u8> = Vec::new();
+        for d in 0..ndays {
+            day_dict_v.extend_from_slice(&((first_day + d as i64) as i32).to_le_bytes());
+        }
+        let mut cat_dict_v: Vec<u8> = Vec::new();
+        for c in &cat_names {
+            put_str(&mut cat_dict_v, c);
+        }
+        let day_dict = &day_dict_v[..];
+        let cat_dict = &cat_dict_v[..];
+        let cat_names = &cat_names;
         std::thread::scope(|s| {
             for (t, (ud, _)) in results.iter().enumerate() {
                 let ud_dir = &ud_dir;
@@ -1923,8 +1948,26 @@ fn main() {
                     if ud.n == 0 && t != 0 {
                         return;
                     }
-                    let bytes = parquet::write_user_daily(ud.n, &ud.uid, &ud.day, &ud.sessions, &ud.events, &ud.revenue, &ud.top_def, &ud.top_val);
-                    fs::write(ud_dir.join(format!("part-{t:03}.parquet")), bytes).unwrap();
+                    let tw = Instant::now();
+                    let (sd, sn, si) = parquet::dict_i64(&ud.sessions);
+                    let (ed, en, ei) = parquet::dict_i64(&ud.events);
+                    let (rd, rn, ri) = parquet::dict_i64(&ud.revenue);
+                    let n = ud.n;
+                    let cols = [
+                        Col { name: "user_id", kind: Kind::Str, optional: false, defs: &[], data: Data::Dict { dict: &ud.names, n: ud.nnames as usize, idx: &ud.uidx } },
+                        Col { name: "day", kind: Kind::Date, optional: false, defs: &[], data: Data::Dict { dict: day_dict, n: ndays, idx: &ud.day } },
+                        Col { name: "sessions", kind: Kind::I64, optional: false, defs: &[], data: Data::Dict { dict: &sd, n: sn, idx: &si } },
+                        Col { name: "events", kind: Kind::I64, optional: false, defs: &[], data: Data::Dict { dict: &ed, n: en, idx: &ei } },
+                        Col { name: "revenue_cents", kind: Kind::I64, optional: false, defs: &[], data: Data::Dict { dict: &rd, n: rn, idx: &ri } },
+                        Col { name: "top_category", kind: Kind::Str, optional: true, defs: &ud.top_def, data: Data::Dict { dict: cat_dict, n: cat_names.len(), idx: &ud.top_idx } },
+                    ];
+                    let tb = tw.elapsed().as_secs_f64() * 1e3;
+                    let f = fs::File::create(ud_dir.join(format!("part-{t:03}.parquet"))).unwrap();
+                    let mut bw = std::io::BufWriter::with_capacity(1 << 16, f);
+                    parquet::write(&mut bw, n, &cols).unwrap();
+                    if verbose {
+                        eprintln!("   part {t}: encode {:.1} ms write {:.1} ms", tb, tw.elapsed().as_secs_f64() * 1e3 - tb);
+                    }
                 });
             }
             let mut n = 0usize;
@@ -1950,8 +1993,18 @@ fn main() {
                     s3.extend_from_slice(&v[3].to_le_bytes());
                 }
             }
-            let bytes = parquet::write_campaign_daily(n, &cid, &ch, &day, &s0, &s1, &s2, &s3);
-            fs::write(cd_dir.join("part-000.parquet"), bytes).unwrap();
+            let cols = [
+                Col { name: "campaign_id", kind: Kind::Str, optional: false, defs: &[], data: Data::Plain(&cid) },
+                Col { name: "channel", kind: Kind::Str, optional: false, defs: &[], data: Data::Plain(&ch) },
+                Col { name: "day", kind: Kind::Date, optional: false, defs: &[], data: Data::Plain(&day) },
+                Col { name: "sessions", kind: Kind::I64, optional: false, defs: &[], data: Data::Plain(&s0) },
+                Col { name: "purchasing_sessions", kind: Kind::I64, optional: false, defs: &[], data: Data::Plain(&s1) },
+                Col { name: "revenue_cents", kind: Kind::I64, optional: false, defs: &[], data: Data::Plain(&s2) },
+                Col { name: "assisted_sessions", kind: Kind::I64, optional: false, defs: &[], data: Data::Plain(&s3) },
+            ];
+            let f = fs::File::create(cd_dir.join("part-000.parquet")).unwrap();
+            let mut bw = std::io::BufWriter::with_capacity(1 << 16, f);
+            parquet::write(&mut bw, n, &cols).unwrap();
         });
         lap("written");
         std::process::exit(0);
