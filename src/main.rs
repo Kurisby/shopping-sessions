@@ -1274,35 +1274,48 @@ impl Ids {
         unsafe { self.slots.as_ptr().add((h as usize) & self.mask) }
     }
     /// Slot of the ID, inserting it when new. Returns (slot, inserted).
+    /// Probes whole 64-byte groups of 4 slots with one vector compare (no per-slot branches).
     #[inline(always)]
     fn intern(&self, h: u64, r: u64) -> (u32, bool) {
-        let mut i = (h as usize) & self.mask;
-        let mut probes = 0u32;
-        loop {
-            let s = unsafe { self.slots.get_unchecked(i) };
-            let k = s.key.load(Relaxed);
-            if k == h {
-                return (i as u32, false);
-            }
-            if k == 0 {
-                match s.key.compare_exchange(0, h, Relaxed, Relaxed) {
-                    Ok(_) => {
-                        unsafe { self.prefs.get_unchecked(i) }.set(r);
-                        return (i as u32, true);
-                    }
-                    Err(k2) => {
-                        if k2 == h {
-                            return (i as u32, false);
+        let mut g = (h as usize) & self.mask & !3;
+        unsafe {
+            let hv = _mm256_set1_epi64x(h as i64);
+            let zero = _mm256_setzero_si256();
+            let mut groups = 0u32;
+            loop {
+                let p = self.slots.as_ptr().add(g) as *const __m256i;
+                let a = _mm256_load_si256(p);
+                let b = _mm256_load_si256(p.add(1));
+                // keys are the even 64-bit lanes: slot k of the group is bit 2k
+                let hit = (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(a, hv))) & 5)
+                    | ((_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(b, hv))) & 5) << 4);
+                if hit != 0 {
+                    return ((g + (hit.trailing_zeros() / 2) as usize) as u32, false);
+                }
+                let empty = (_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(a, zero))) & 5)
+                    | ((_mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(b, zero))) & 5) << 4);
+                if empty != 0 {
+                    let i = g + (empty.trailing_zeros() / 2) as usize;
+                    match self.slots.get_unchecked(i).key.compare_exchange(0, h, Relaxed, Relaxed) {
+                        Ok(_) => {
+                            self.prefs.get_unchecked(i).set(r);
+                            return (i as u32, true);
+                        }
+                        Err(k2) => {
+                            if k2 == h {
+                                return (i as u32, false);
+                            }
+                            continue; // another ID took the slot: look at the group again
                         }
                     }
                 }
+                groups += 1;
+                if groups > 128 {
+                    self.overflow.store(true, Relaxed);
+                    return (0, false);
+                }
+                g = (g + 4) & self.mask;
             }
-            probes += 1;
-            if probes > 512 {
-                self.overflow.store(true, Relaxed);
-                return (0, false);
-            }
-            i = (i + 1) & self.mask;
         }
     }
     /// Person (representative slot) of an ID seen in events or clicks.
