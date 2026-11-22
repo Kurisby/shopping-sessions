@@ -2405,8 +2405,20 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
                     }
                     lo += 1;
                 }
-                for &c in w.active.iter() {
-                    *w.assisted.get_unchecked_mut(c as usize * ndays + dayidx) += 1;
+                // the window rarely holds more than 4 campaigns: those take a fixed, branch-free
+                // pass (unused lanes add 0 to slot 0), the rest a loop
+                let na = w.active.len();
+                if na <= 4 {
+                    let ap = w.active.as_ptr();
+                    for q in 0..4 {
+                        let on = q < na;
+                        let c = if on { *ap.add(q.min(na.max(1) - 1)) as usize } else { 0 };
+                        *w.assisted.get_unchecked_mut(c * ndays + dayidx) += on as u32;
+                    }
+                } else {
+                    for &c in w.active.iter() {
+                        *w.assisted.get_unchecked_mut(c as usize * ndays + dayidx) += 1;
+                    }
                 }
                 if hi > lo {
                     let mut bi = hi - 1;
@@ -2425,10 +2437,8 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
             };
             let cc = w.credited.get_unchecked_mut(camp * ndays + dayidx);
             cc[0] += 1;
-            if rev > 0 {
-                cc[1] += 1;
-                cc[2] += rev;
-            }
+            cc[1] += (rev > 0) as i64;
+            cc[2] += rev;
             k = m;
         }
         for &c in w.active.iter() {
