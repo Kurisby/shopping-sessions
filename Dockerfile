@@ -4,8 +4,8 @@ FROM rust:1.86-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-# x86-64-v3 = AVX2/BMI2/FMA, safe on every Cascade Lake or newer Xeon.
-ENV RUSTFLAGS="-C target-cpu=x86-64-v3"
+# x86-64-v3 = AVX2/BMI2/FMA, plus AES-NI for hashing: safe on every Cascade Lake or newer Xeon.
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+aes"
 RUN cargo build --release --locked && strip target/release/pipeline
 
 FROM debian:bookworm-slim
