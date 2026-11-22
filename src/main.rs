@@ -553,14 +553,6 @@ fn for_each_line(chunk: &'static [u8], mut f: impl FnMut(&'static [u8])) {
 
 // ---------------------------------------------------------------- SIMD line scanner
 
-struct Scanner {
-    p: *const u8, // current 64-byte block
-    end: *const u8,
-    sep: u64,
-    qm: u64,
-    qcum: u32, // quotes before block p
-}
-
 #[inline(always)]
 unsafe fn block_masks(p: *const u8) -> (u64, u64) {
     let a = _mm256_loadu_si256(p as *const __m256i);
@@ -576,122 +568,173 @@ unsafe fn block_masks(p: *const u8) -> (u64, u64) {
     (s, q)
 }
 
-impl Scanner {
-    #[inline(always)]
-    unsafe fn new(start: *const u8, end: *const u8) -> Self {
-        let mut s = Scanner { p: start, end, sep: 0, qm: 0, qcum: 0 };
-        s.load();
-        s
+
+// ---------------------------------------------------------------- region-indexed line splitter
+// Each region (<= ~64 KB, whole lines) first gets a flat index of every ',' / '\n' offset
+// (branch-light, 8 per block unconditionally), plus per-block quote counts. Lines then take
+// their N separators straight from the index: no per-block refill branch per field.
+
+const REGION: usize = 1 << 16;
+
+struct Flat {
+    idx: Vec<u32>,
+    qcum: Vec<u32>,
+    qm: Vec<u64>,
+    n: usize,
+}
+
+impl Flat {
+    fn new() -> Self {
+        Flat { idx: Vec::new(), qcum: Vec::new(), qm: Vec::new(), n: 0 }
     }
     #[inline(always)]
-    unsafe fn load(&mut self) {
-        let (mut s, mut q) = block_masks(self.p);
-        let rem = self.end.offset_from(self.p);
-        if rem < 64 {
-            let m = if rem <= 0 { 0 } else { (1u64 << rem) - 1 };
-            s &= m;
-            q &= m;
+    unsafe fn build(&mut self, start: *const u8, len: usize) {
+        let nb = (len + 63) / 64;
+        if self.idx.capacity() < len + 96 {
+            self.idx = Vec::with_capacity(len + 96);
         }
-        self.sep = s;
-        self.qm = q;
-    }
-    /// Next ',' or '\n' position, or `end`.
-    #[inline(always)]
-    unsafe fn next_sep(&mut self) -> *const u8 {
-        while self.sep == 0 {
-            if self.p >= self.end {
-                return self.end;
+        if self.qcum.capacity() < nb + 2 {
+            self.qcum = Vec::with_capacity(nb + 2);
+            self.qm = Vec::with_capacity(nb + 2);
+        }
+        let ip = self.idx.as_mut_ptr();
+        let qc = self.qcum.as_mut_ptr();
+        let qmp = self.qm.as_mut_ptr();
+        let mut n = 0usize;
+        let mut qsum = 0u32;
+        for b in 0..nb {
+            let (mut s, mut q) = block_masks(start.add(b * 64));
+            let rem = len - b * 64;
+            if rem < 64 {
+                let m = (1u64 << rem) - 1;
+                s &= m;
+                q &= m;
             }
-            self.qcum += self.qm.count_ones();
-            self.p = self.p.add(64);
-            if self.p >= self.end {
-                self.qm = 0;
-                return self.end;
+            *qc.add(b) = qsum;
+            *qmp.add(b) = q;
+            qsum += q.count_ones();
+            let base = (b * 64) as u32;
+            let cnt = s.count_ones() as usize;
+            let o = ip.add(n);
+            for k in 0..8 {
+                *o.add(k) = base + s.trailing_zeros();
+                s &= s.wrapping_sub(1);
             }
-            self.load();
+            if cnt > 8 {
+                for k in 8..16 {
+                    *o.add(k) = base + s.trailing_zeros();
+                    s &= s.wrapping_sub(1);
+                }
+                if cnt > 16 {
+                    let mut k = 16;
+                    while s != 0 {
+                        *o.add(k) = base + s.trailing_zeros();
+                        s &= s.wrapping_sub(1);
+                        k += 1;
+                    }
+                }
+            }
+            n += cnt;
         }
-        let tz = self.sep.trailing_zeros();
-        self.sep &= self.sep - 1;
-        self.p.add(tz as usize)
+        for k in 0..16 {
+            *ip.add(n + k) = len as u32;
+        }
+        *qc.add(nb) = qsum;
+        *qmp.add(nb) = 0;
+        self.n = n;
     }
-    /// Quotes strictly before `pos`; pos must be in the current block or at/after its start.
     #[inline(always)]
-    unsafe fn quotes_before(&self, pos: *const u8) -> u32 {
-        let off = pos.offset_from(self.p);
-        if off <= 0 {
-            self.qcum
-        } else if off >= 64 {
-            self.qcum + self.qm.count_ones()
-        } else {
-            self.qcum + (self.qm & ((1u64 << off) - 1)).count_ones()
-        }
+    unsafe fn qbefore(&self, off: u32) -> u32 {
+        let b = (off >> 6) as usize;
+        let r = off & 63;
+        *self.qcum.as_ptr().add(b) + (*self.qm.as_ptr().add(b) & ((1u64 << r) - 1)).count_ones()
     }
 }
 
-/// Splits the next line into N fields. Returns (ok, next line start).
-/// Fields are (ptr, len) with whole-field quotes stripped.
+/// Calls `f` with the N fields (quotes stripped) of every well-formed line of `chunk`
+/// (whole lines; the last may lack its '\n').
 #[inline(always)]
-unsafe fn next_line<const N: usize>(sc: &mut Scanner, ls: *const u8, qs: &mut u32, fp: &mut [*const u8; N], fl: &mut [usize; N]) -> (bool, *const u8) {
-    let end = sc.end;
-    let mut seps: [*const u8; N] = [std::ptr::null(); N];
-    for i in 0..N {
-        seps[i] = sc.next_sep();
-    }
-    let mut good = true;
-    for i in 0..N - 1 {
-        good &= (seps[i] < end) & (*seps[i] == b',');
-    }
-    let last = seps[N - 1];
-    good &= (last >= end) | (*last == b'\n');
-    if !good {
-        // malformed: find where this line really ends, then restart the scanner there
-        let mut le = std::ptr::null();
-        for i in 0..N {
-            if seps[i] >= end || *seps[i] == b'\n' {
-                le = seps[i];
-                break;
+unsafe fn for_lines<const N: usize>(flat: &mut Flat, chunk: &'static [u8], mut f: impl FnMut(&[*const u8; N], &[usize; N])) {
+    let cs = chunk.as_ptr();
+    let clen = chunk.len();
+    let mut fp: [*const u8; N] = [std::ptr::null(); N];
+    let mut fl: [usize; N] = [0; N];
+    let mut rs = 0usize;
+    while rs < clen {
+        let mut re = rs + REGION;
+        if re >= clen {
+            re = clen;
+        } else {
+            let mut p = re;
+            while p > rs && *cs.add(p - 1) != b'\n' {
+                p -= 1;
+            }
+            if p > rs {
+                re = p;
+            } else {
+                re = memchr_nl(chunk, re);
+                re = if re < clen { re + 1 } else { clen };
             }
         }
-        if le.is_null() {
-            let mut p = last;
-            while p < end && *p != b'\n' {
-                p = p.add(1);
+        let base = cs.add(rs);
+        let len = (re - rs) as u32;
+        flat.build(base, re - rs);
+        let ix = flat.idx.as_ptr();
+        let mut j = 0usize;
+        let mut ls = 0u32;
+        while ls < len {
+            let s = ix.add(j);
+            let mut good = true;
+            for i in 0..N - 1 {
+                let o = *s.add(i);
+                good &= (o < len) & (*base.add(o as usize) == b',');
             }
-            le = p;
+            let last = *s.add(N - 1);
+            good &= (last >= len) | (*base.add(last.min(len) as usize) == b'\n');
+            if !good {
+                let mut k = j;
+                loop {
+                    let o = *ix.add(k);
+                    if o >= len || *base.add(o as usize) == b'\n' {
+                        break;
+                    }
+                    k += 1;
+                }
+                ls = (*ix.add(k)).min(len - 1) + 1;
+                j = k + 1;
+                continue;
+            }
+            fp[0] = base.add(ls as usize);
+            fl[0] = (*s - ls) as usize;
+            for i in 1..N {
+                let a = *s.add(i - 1) + 1;
+                fp[i] = base.add(a as usize);
+                fl[i] = (*s.add(i) - a) as usize;
+            }
+            let q = flat.qbefore(last) - flat.qbefore(ls);
+            ls = last + 1;
+            j += N;
+            if q != 0 {
+                let mut fq = 0u32;
+                let mut okq = true;
+                for i in 0..N {
+                    let p = fp[i];
+                    let n = fl[i];
+                    let first_q = (n > 0) & (*p == b'"');
+                    let last_q = (n >= 2) & (*p.add(n.saturating_sub(1)) == b'"');
+                    okq &= !first_q | last_q;
+                    fq += first_q as u32;
+                    fp[i] = p.add(first_q as usize);
+                    fl[i] = n.wrapping_sub(2 * first_q as usize);
+                }
+                if !okq || q != 2 * fq {
+                    continue;
+                }
+            }
+            f(&fp, &fl);
         }
-        let nls = if le >= end { end } else { le.add(1) };
-        *sc = Scanner::new(nls, end);
-        *qs = 0;
-        return (false, nls);
+        rs = re;
     }
-    fp[0] = ls;
-    fl[0] = seps[0].offset_from(ls) as usize;
-    for i in 1..N {
-        fp[i] = seps[i - 1].add(1);
-        fl[i] = seps[i].offset_from(fp[i]) as usize;
-    }
-    let qe = sc.quotes_before(last);
-    let q = qe - *qs;
-    *qs = qe;
-    let nls = last.add(1);
-    if q != 0 {
-        let mut fq = 0u32;
-        let mut okq = true;
-        for i in 0..N {
-            let p = fp[i];
-            let n = fl[i];
-            let first_q = (n > 0) & (*p == b'"');
-            let last_q = (n >= 2) & (*p.add(n.saturating_sub(1)) == b'"');
-            okq &= !first_q | last_q;
-            fq += first_q as u32;
-            fp[i] = p.add(first_q as usize);
-            fl[i] = n.wrapping_sub(2 * first_q as usize);
-        }
-        if !okq || q != 2 * fq {
-            return (false, nls);
-        }
-    }
-    (true, nls)
 }
 
 #[inline(always)]
@@ -1091,6 +1134,7 @@ struct ThreadOut {
     ring: [Pending; RING],
     rn: usize,
     rh: usize,
+    flat: Flat,
 }
 
 impl ThreadOut {
@@ -1158,18 +1202,10 @@ unsafe fn parse_events(ctx: &Ctx, chunk: &'static [u8], out: &mut ThreadOut) {
     let ws = ctx.ws;
     let we = ctx.we;
     let base = ctx.base;
-    let start = chunk.as_ptr();
-    let end = start.add(chunk.len());
-    let mut sc = Scanner::new(start, end);
-    let mut ls = start;
-    let mut qs = 0u32;
-    let mut fp: [*const u8; 7] = [std::ptr::null(); 7];
-    let mut fl: [usize; 7] = [0; 7];
-    while ls < end {
-        let (ok, nls) = next_line::<7>(&mut sc, ls, &mut qs, &mut fp, &mut fl);
-        ls = nls;
-        if !ok || fl[0] == 0 {
-            continue;
+    let mut flat = std::mem::replace(&mut out.flat, Flat::new());
+    for_lines::<7>(&mut flat, chunk, |fp, fl| {
+        if fl[0] == 0 {
+            return;
         }
         let ehash = hash_ptr(fp[0], fl[0]);
         let ingest = parse_ts_fast(fp[3], fl[3]);
@@ -1179,22 +1215,22 @@ unsafe fn parse_events(ctx: &Ctx, chunk: &'static [u8], out: &mut ThreadOut) {
         out.dk.push(ebucket(ehash), DKey { ehash, ingest: ingest_rel, rowid });
         // validation
         if fl[1] == 0 || fl[5] == 0 {
-            continue;
+            return;
         }
         let ts = parse_ts_fast(fp[2], fl[2]);
         if ts < ws || ts >= we {
-            continue;
+            return;
         }
         let mut pc = 0u32;
         if fl[4] == 4 {
             let w = std::ptr::read_unaligned(fp[4] as *const u32);
             if w != u32::from_le_bytes(*b"view") && w != u32::from_le_bytes(*b"cart") {
-                continue;
+                return;
             }
         } else if fl[4] == 8 && std::ptr::read_unaligned(fp[4] as *const u64) == u64::from_le_bytes(*b"purchase") {
             let price = match parse_price(sl(fp[6], fl[6])) {
                 Some(p) => p,
-                None => continue,
+                None => return,
             };
             let cat = match ctx.products.get(sl(fp[5], fl[5])) {
                 ABSENT => ctx.unknown_cat,
@@ -1202,14 +1238,15 @@ unsafe fn parse_events(ctx: &Ctx, chunk: &'static [u8], out: &mut ThreadOut) {
             };
             pc = (price << 8) | cat;
         } else {
-            continue;
+            return;
         }
         if ingest == BAD_TS || ingest - ts > DAY {
-            continue;
+            return;
         }
         let uhash = hash_ptr(fp[1], fl[1]);
         out.push_pending(Pending { uhash, uref: mkref(fp[1], fl[1]), a: (ts - base) as u32, b: pc, c: rowid }, ctx);
-    }
+    });
+    out.flat = flat;
     while out.rn > 0 {
         out.pop_event(ctx);
     }
@@ -1218,31 +1255,24 @@ unsafe fn parse_events(ctx: &Ctx, chunk: &'static [u8], out: &mut ThreadOut) {
 unsafe fn parse_clicks(ctx: &Ctx, chunk: &'static [u8], out: &mut ThreadOut) {
     let lo = ctx.base;
     let we = ctx.we;
-    let start = chunk.as_ptr();
-    let end = start.add(chunk.len());
-    let mut sc = Scanner::new(start, end);
-    let mut ls = start;
-    let mut qs = 0u32;
-    let mut fp: [*const u8; 4] = [std::ptr::null(); 4];
-    let mut fl: [usize; 4] = [0; 4];
     let mut ring = ClickRing { ring: [PendingClick::default(); RING], rn: 0, rh: 0 };
-    while ls < end {
-        let (ok, nls) = next_line::<4>(&mut sc, ls, &mut qs, &mut fp, &mut fl);
-        ls = nls;
-        if !ok || fl[0] == 0 || fl[1] == 0 {
-            continue;
+    let mut flat = std::mem::replace(&mut out.flat, Flat::new());
+    for_lines::<4>(&mut flat, chunk, |fp, fl| {
+        if fl[0] == 0 || fl[1] == 0 {
+            return;
         }
         let camp = ctx.campaigns.get(sl(fp[2], fl[2]));
         if camp == ABSENT {
-            continue;
+            return;
         }
         let ts = parse_ts_fast(fp[3], fl[3]);
         if ts < lo || ts >= we {
-            continue;
+            return;
         }
         let uhash = hash_ptr(fp[1], fl[1]);
         ring.push(PendingClick { uhash, uref: mkref(fp[1], fl[1]), kref: mkref(fp[0], fl[0]), ts: (ts - lo) as u32, camp }, ctx, out);
-    }
+    });
+    out.flat = flat;
     while ring.rn > 0 {
         ring.pop(ctx, out);
     }
@@ -1724,6 +1754,7 @@ fn main() {
                         ring: [Pending::default(); RING],
                         rn: 0,
                         rh: 0,
+                        flat: Flat::new(),
                     };
                     loop {
                         let j = next.fetch_add(1, Relaxed);
