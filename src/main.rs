@@ -1250,33 +1250,42 @@ impl Name {
     }
 }
 
+const IDS_PAD: usize = 1024;
+
 struct Ids {
     slots: &'static [Slot],
     prefs: &'static [Name], // the ID's bytes
-    mask: usize,
-    bits: u32,
+    cap: u64, // home slots are 0..cap
+    n: usize, // slots, including IDS_PAD past cap
     overflow: AtomicBool,
 }
 
 impl Ids {
     fn new(cap: usize) -> Self {
-        let cap = cap.next_power_of_two().max(1024);
+        // any size (no power-of-two rounding: a smaller table stays cache-resident longer);
+        // probes run past the home range into IDS_PAD spare slots instead of wrapping
+        let cap = cap.max(1024);
+        let n = cap + IDS_PAD;
         Ids {
-            slots: zeroed::<Slot>(cap),
-            prefs: zeroed::<Name>(cap),
-            mask: cap - 1,
-            bits: cap.trailing_zeros(),
+            slots: zeroed::<Slot>(n),
+            prefs: zeroed::<Name>(n),
+            cap: cap as u64,
+            n,
             overflow: AtomicBool::new(false),
         }
     }
     #[inline(always)]
+    fn home(&self, h: u64) -> usize {
+        (((h >> 32) * self.cap) >> 32) as usize
+    }
+    #[inline(always)]
     fn slot_ptr(&self, h: u64) -> *const Slot {
-        unsafe { self.slots.as_ptr().add((h as usize) & self.mask) }
+        unsafe { self.slots.as_ptr().add(self.home(h)) }
     }
     /// Slot of the ID, inserting it when new. Returns (slot, inserted).
     #[inline(always)]
     fn intern(&self, h: u64, r: u64) -> (u32, bool) {
-        let mut i = (h as usize) & self.mask;
+        let mut i = self.home(h);
         let mut probes = 0u32;
         loop {
             let s = unsafe { self.slots.get_unchecked(i) };
@@ -1302,7 +1311,7 @@ impl Ids {
                 self.overflow.store(true, Relaxed);
                 return (0, false);
             }
-            i = (i + 1) & self.mask;
+            i += 1;
         }
     }
     /// Person (representative slot) of an ID seen in events or clicks.
@@ -1360,7 +1369,7 @@ fn uf_union(ids: &Ids, parent: &[AtomicU32], a: u32, b: u32) {
 
 /// Joins linked IDs; every linked ID's slot gets its representative (byte-wise smallest ID).
 fn build_links(ids: &Ids, link_chunks: &[&'static [u8]], nthreads: usize) {
-    let cap = ids.mask + 1;
+    let cap = ids.n;
     let parent: &'static [AtomicU32] = zeroed::<AtomicU32>(cap);
     let next = AtomicUsize::new(0);
     let mut inserted: Vec<Vec<u32>> = Vec::new();
@@ -2263,8 +2272,9 @@ fn main() {
         }
         let ncamp = crows.len();
         lap("links");
-        let pshift = ids.bits.saturating_sub(NPB.trailing_zeros());
-        let npb = 1usize << (ids.bits - pshift);
+        let bits = usize::BITS - 1 - ids.n.leading_zeros(); // floor(log2(n))
+        let pshift = bits.saturating_sub(NPB.trailing_zeros());
+        let npb = (ids.n + (1 << pshift) - 1) >> pshift;
         let ctx = Ctx { ws, we, base, products, campaigns, ncat: cat_names.len(), unknown_cat, ncamp, first_day, ndays, ids, pshift };
 
         // ---- phase 1: parse events and clicks
