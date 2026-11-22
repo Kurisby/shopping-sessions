@@ -143,29 +143,41 @@ fn encode_indices(idx: &[u32], ndict: usize) -> Vec<u8> {
     }
     let n = idx.len();
     let groups = (n + 7) / 8;
-    let mut out = Vec::with_capacity(groups * bw as usize + 16);
+    let total = groups * bw as usize;
+    let mut out = Vec::with_capacity(total + 32);
     out.push(bw as u8);
     if n == 0 {
         return out;
     }
     hdr_varint(&mut out, ((groups as u64) << 1) | 1);
-    let mut acc: u64 = 0;
-    let mut nb: u32 = 0;
-    for g in 0..groups {
-        for k in 0..8 {
-            let i = g * 8 + k;
-            let v = if i < n { idx[i] as u64 } else { 0 };
-            acc |= v << nb;
+    let start = out.len();
+    // Each value is OR-ed into a 64-bit window that is stored whole (at most 7 + 32 bits are
+    // live) and then advanced by its complete bytes: no per-byte loop.
+    unsafe {
+        let mut p = out.as_mut_ptr().add(start);
+        let mut acc: u64 = 0;
+        let mut nb: u32 = 0;
+        for &v in idx {
+            acc |= (v as u64) << nb;
             nb += bw;
-            while nb >= 8 {
-                out.push(acc as u8);
-                acc >>= 8;
-                nb -= 8;
-            }
+            std::ptr::write_unaligned(p as *mut u64, acc);
+            let adv = nb >> 3;
+            p = p.add(adv as usize);
+            acc >>= adv * 8;
+            nb &= 7;
         }
+        // zero values pad the last group of 8, which ends on a byte boundary
+        for _ in n..groups * 8 {
+            nb += bw;
+            std::ptr::write_unaligned(p as *mut u64, acc);
+            let adv = nb >> 3;
+            p = p.add(adv as usize);
+            acc >>= adv * 8;
+            nb &= 7;
+        }
+        debug_assert!(nb == 0 && p == out.as_mut_ptr().add(start + total));
+        out.set_len(start + total);
     }
-    // groups of 8 values always end on a byte boundary
-    debug_assert!(nb == 0);
     out
 }
 
@@ -321,6 +333,9 @@ pub fn write(w: &mut impl Write, num_rows: usize, cols: &[Col]) -> std::io::Resu
 
 /// Dictionary-encodes integer values (first-appearance order): (PLAIN i64 dictionary, count, indices).
 pub fn dict_i64(vals: &[u64]) -> (Vec<u8>, usize, Vec<u32>) {
+    // small values (nearly all counts) take a direct table; the rest an open-addressing map
+    const SMALL: usize = 4096;
+    let mut small: Vec<u32> = vec![u32::MAX; SMALL];
     let mut cap = 1024usize;
     let mut keys: Vec<u64> = vec![u64::MAX; cap];
     let mut ids: Vec<u32> = vec![0; cap];
@@ -328,6 +343,15 @@ pub fn dict_i64(vals: &[u64]) -> (Vec<u8>, usize, Vec<u32>) {
     let mut idx: Vec<u32> = Vec::with_capacity(vals.len());
     let hash = |v: u64| (v.wrapping_mul(0x9E3779B97F4A7C15) >> 20) as usize;
     for &v in vals {
+        if v < SMALL as u64 {
+            let s = unsafe { small.get_unchecked_mut(v as usize) };
+            if *s == u32::MAX {
+                *s = dict.len() as u32;
+                dict.push(v);
+            }
+            idx.push(*s);
+            continue;
+        }
         let mask = cap - 1;
         let mut p = hash(v) & mask;
         loop {
@@ -347,6 +371,9 @@ pub fn dict_i64(vals: &[u64]) -> (Vec<u8>, usize, Vec<u32>) {
                     ids = vec![0; cap];
                     let mask = cap - 1;
                     for (i, &d) in dict.iter().enumerate() {
+                        if d < SMALL as u64 {
+                            continue;
+                        }
                         let mut q = hash(d) & mask;
                         while keys[q] != u64::MAX {
                             q = (q + 1) & mask;

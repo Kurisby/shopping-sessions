@@ -259,29 +259,59 @@ fn mum(a: u64, b: u64) -> u64 {
     (r as u64) ^ ((r >> 64) as u64)
 }
 
-/// AES-round string hash (AES-NI): rounds are bijections on the 128-bit state, so distinct
-/// IDs of up to 16 bytes never collide before the 64-bit truncation, and 3 rounds spread
-/// every input byte over every output byte. Never returns 0.
-/// Reads up to 15 bytes past the end when n < 16: only for padded memory.
+#[repr(C, align(64))]
+struct HMask([u8; 96]);
+/// 48 x 0xFF then 48 x 0: 16 bytes from offset 48 - n + 16 j mask block j of an n-byte ID.
+static HMASK: HMask = HMask({
+    let mut m = [0u8; 96];
+    let mut i = 0;
+    while i < 48 {
+        m[i] = 0xFF;
+        i += 1;
+    }
+    m
+});
+
+/// AES-round string hash (AES-NI) of an ID. Up to 48 bytes it is branch-free: three 16-byte
+/// blocks, masked to the ID's length, each absorbed by one round, then the length. Rounds are
+/// bijections on the 128-bit state, so distinct IDs of up to 16 bytes never collide before
+/// the 64-bit truncation. Every block byte passes at least two rounds after it is absorbed
+/// (full diffusion); the length passes one, which moves it into the low four bytes.
+/// Never returns 0. Reads 48 bytes from `p` whatever `n` is: only for padded memory.
 #[inline(always)]
 unsafe fn hash_ptr(p: *const u8, n: usize) -> u64 {
+    if n > 48 {
+        return hash_long(p, n);
+    }
     let k0 = _mm_set_epi64x(S0 as i64, S1 as i64);
-    let k1 = _mm_set_epi64x(S3 as i64, (S0 ^ n as u64) as i64);
-    let s = if n <= 16 {
-        const IOTA: __m128i = v128([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
-        let keep = _mm_cmpgt_epi8(_mm_set1_epi8(n as i8), IOTA);
-        let x = _mm_and_si128(_mm_loadu_si128(p as *const __m128i), keep);
-        _mm_aesenc_si128(_mm_aesenc_si128(_mm_xor_si128(x, k0), k1), k0)
+    let m = HMASK.0.as_ptr().add(48 - n);
+    let x0 = _mm_and_si128(_mm_loadu_si128(p as *const __m128i), _mm_loadu_si128(m as *const __m128i));
+    let x1 = _mm_and_si128(_mm_loadu_si128(p.add(16) as *const __m128i), _mm_loadu_si128(m.add(16) as *const __m128i));
+    let x2 = _mm_and_si128(_mm_loadu_si128(p.add(32) as *const __m128i), _mm_loadu_si128(m.add(32) as *const __m128i));
+    let s = _mm_aesenc_si128(_mm_aesenc_si128(_mm_xor_si128(x0, k0), x1), x2);
+    let s = _mm_aesenc_si128(_mm_aesenc_si128(s, _mm_cvtsi64_si128(n as i64)), k0);
+    let h = _mm_cvtsi128_si64(s) as u64;
+    if h == 0 {
+        1
     } else {
-        let mut s = _mm_xor_si128(_mm_loadu_si128(p as *const __m128i), k0);
-        let mut i = 16;
-        while i + 16 < n {
-            s = _mm_aesenc_si128(s, _mm_loadu_si128(p.add(i) as *const __m128i));
-            i += 16;
-        }
-        s = _mm_aesenc_si128(s, _mm_loadu_si128(p.add(n - 16) as *const __m128i));
-        _mm_aesenc_si128(_mm_aesenc_si128(s, k1), k0)
-    };
+        h
+    }
+}
+
+/// `hash_ptr` for IDs over 48 bytes.
+#[cold]
+#[inline(never)]
+unsafe fn hash_long(p: *const u8, n: usize) -> u64 {
+    let k0 = _mm_set_epi64x(S0 as i64, S1 as i64);
+    let k1 = _mm_xor_si128(_mm_set_epi64x(S3 as i64, S0 as i64), _mm_cvtsi64_si128(n as i64));
+    let mut s = _mm_xor_si128(_mm_loadu_si128(p as *const __m128i), k0);
+    let mut i = 16;
+    while i + 16 < n {
+        s = _mm_aesenc_si128(s, _mm_loadu_si128(p.add(i) as *const __m128i));
+        i += 16;
+    }
+    s = _mm_aesenc_si128(s, _mm_loadu_si128(p.add(n - 16) as *const __m128i));
+    s = _mm_aesenc_si128(_mm_aesenc_si128(s, k1), k0);
     let h = _mm_cvtsi128_si64(_mm_aesenc_si128(s, k1)) as u64;
     if h == 0 {
         1
@@ -292,10 +322,10 @@ unsafe fn hash_ptr(p: *const u8, n: usize) -> u64 {
 
 /// Same value as hash_ptr, safe on any slice.
 fn hash_bytes(b: &[u8]) -> u64 {
-    if b.len() >= 16 {
+    if b.len() > 48 {
         unsafe { hash_ptr(b.as_ptr(), b.len()) }
     } else {
-        let mut buf = [0u8; 16];
+        let mut buf = [0u8; 48];
         buf[..b.len()].copy_from_slice(b);
         unsafe { hash_ptr(buf.as_ptr(), b.len()) }
     }
@@ -2352,7 +2382,9 @@ fn main() {
     let verbose = std::env::var("SS_VERBOSE").is_ok();
     let lap = |what: &str| {
         if verbose {
-            eprintln!("{what:>12} {:8.1} ms", t0.elapsed().as_secs_f64() * 1000.0);
+            let st = fs::read_to_string("/proc/self/status").unwrap_or_default();
+            let g = |k: &str| st.lines().find(|l| l.starts_with(k)).map(|l| l.split_whitespace().nth(1).unwrap_or("?").to_string()).unwrap_or_default();
+            eprintln!("{what:>12} {:8.1} ms  anon {} file {} kB", t0.elapsed().as_secs_f64() * 1000.0, g("RssAnon"), g("RssFile"));
         }
     };
     let args: Vec<String> = std::env::args().collect();
@@ -2948,7 +2980,7 @@ mod tests {
         let mut pad = vec![0u8; 128];
         let alnum = b"0123456789abcdefghijklmnopqrstuvwxyz";
         for it in 0..3_000_000u64 {
-            let n = match it % 4 { 0 => 9, 1 => 33, 2 => 8, _ => 1 + (r.next() % 48) as usize };
+            let n = match it % 4 { 0 => 9, 1 => 33, 2 => 8, _ => 1 + (r.next() % 80) as usize };
             let mut v: Vec<u8> = (0..n).map(|_| alnum[(r.next() % if n == 33 { 16 } else { 36 }) as usize]).collect();
             v[0] = b'u';
             for (k, b) in pad.iter_mut().enumerate() {
