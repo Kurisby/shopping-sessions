@@ -1621,6 +1621,9 @@ impl<T: Copy + 'static> Buckets<T> {
             let p = c[0];
             *p = v;
             c[0] = p.add(1);
+            // the bucket's next line, for its next push (thousands of rows away: from L2,
+            // not a fresh-memory miss)
+            _mm_prefetch(p.add(1) as *const i8, _MM_HINT_ET0);
             *self.rend.get_unchecked(b) - c[1].offset_from(p) as u32
         }
     }
@@ -1643,6 +1646,7 @@ impl<T: Copy + 'static> Buckets<T> {
             let p = c[0];
             *p = v;
             c[0] = p.add(1);
+            _mm_prefetch(p.add(1) as *const i8, _MM_HINT_ET0);
         }
     }
     #[cold]
