@@ -1546,6 +1546,7 @@ struct CRec {
     kref: u64,
 }
 
+const LPD: usize = 24;
 static BMAX: AtomicU64 = AtomicU64::new(0);
 static BMAXJ: AtomicU64 = AtomicU64::new(0);
 
@@ -1778,6 +1779,7 @@ struct CKey {
 }
 
 struct PersonWork {
+    small: [u64; 33],
     cat_sum: Vec<u64>,
     wcnt: Vec<u32>,
     wpos: Vec<u32>,
@@ -1808,6 +1810,65 @@ fn sort_small<T: Copy>(v: &mut [T], tmp: &mut Vec<T>, key: impl Fn(&T) -> u64) {
 }
 
 const RADIX_MIN: usize = 2048;
+
+/// Sorts a person's events (ts << 32 | pc) by time (the order of equal times is free) and
+/// returns them: in place, or for a small person in `small`.
+#[inline(always)]
+unsafe fn sort_events<'a>(v: &'a mut [u64], tmp: &mut Vec<u64>, small: &'a mut [u64; 33]) -> &'a [u64] {
+    let n = v.len();
+    if n <= 8 {
+        if n <= 1 {
+            return v;
+        }
+        rank_sort::<2>(v, small);
+    } else if n <= 16 {
+        rank_sort::<4>(v, small);
+    } else if n <= 32 {
+        rank_sort::<8>(v, small);
+    } else {
+        sort_small(v, tmp, |&x| x);
+        return v;
+    }
+    &small[..n]
+}
+
+/// Branch-free sort of 2..=4*NB events into `out` (most persons have few): each event's
+/// rank is the number of events before it in (time, position) order, counted with vector
+/// compares of every event against every other. Loops run a fixed 4*NB times.
+#[inline(always)]
+unsafe fn rank_sort<const NB: usize>(v: &[u64], out: &mut [u64; 33]) {
+    let n = v.len();
+    debug_assert!(n >= 1 && n <= 4 * NB);
+    let mut k = [0i64; 32];
+    let mut val = [0u64; 32];
+    for i in 0..4 * NB {
+        let x = *v.get_unchecked(i.min(n - 1));
+        // ts < 2^31, so (ts << 5 | i) is a unique, positive key in time order;
+        // padding lanes get the largest key, rank n, and land in out[n] (never read)
+        *k.get_unchecked_mut(i) = if i < n { (((x >> 32) << 5) | i as u64) as i64 } else { i64::MAX };
+        *val.get_unchecked_mut(i) = x;
+    }
+    let kp = k.as_ptr() as *const __m256i;
+    let mut blk = [_mm256_setzero_si256(); NB];
+    let mut acc = [_mm256_setzero_si256(); NB];
+    for m in 0..NB {
+        blk[m] = _mm256_loadu_si256(kp.add(m));
+    }
+    for j in 0..4 * NB {
+        let b = _mm256_set1_epi64x(*k.get_unchecked(j));
+        for m in 0..NB {
+            // lanes whose key is greater than key j gain one
+            acc[m] = _mm256_sub_epi64(acc[m], _mm256_cmpgt_epi64(blk[m], b));
+        }
+    }
+    let mut r = [0u64; 32];
+    for m in 0..NB {
+        _mm256_storeu_si256((r.as_mut_ptr() as *mut __m256i).add(m), acc[m]);
+    }
+    for i in 0..4 * NB {
+        *out.get_unchecked_mut(*r.get_unchecked(i) as usize) = *val.get_unchecked(i);
+    }
+}
 
 #[inline(never)]
 fn radix_hi32<T: Copy>(v: &mut [T], tmp: &mut Vec<T>, key: impl Fn(&T) -> u64) {
@@ -1857,11 +1918,20 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
     // count (and drop dedup losers in place)
     let mut total = 0usize;
     for o in outs {
+        // all of a thread's records carry its id; their row numbers rise, ~npb rows apart,
+        // so each check reads a different bitmap line: prefetch them well ahead
+        let lw = losers.get_unchecked(o.tid as usize).as_ptr();
         for part in [o.pe.main(b), o.pe.spilled(b)] {
-            for r in part.iter_mut() {
-                let t = (r.rowid >> 27) as usize;
+            let n = part.len();
+            let pp = part.as_mut_ptr();
+            for j in 0..n {
+                if j + LPD < n {
+                    let i2 = ((*pp.add(j + LPD)).rowid & ((1 << 27) - 1)) as usize;
+                    _mm_prefetch(lw.add(i2 >> 6) as *const i8, _MM_HINT_T0);
+                }
+                let r = &mut *pp.add(j);
                 let i = (r.rowid & ((1 << 27) - 1)) as usize;
-                if losers.get_unchecked(t).get_unchecked(i >> 6).load(Relaxed) & (1u64 << (i & 63)) != 0 {
+                if (*lw.add(i >> 6)).load(Relaxed) & (1u64 << (i & 63)) != 0 {
                     r.pid = INVALID;
                 } else {
                     *w.cnt.get_unchecked_mut((r.pid - lo_pid) as usize) += 1;
@@ -1964,11 +2034,11 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
         let ee = *w.cnt.get_unchecked(p) as usize;
         let cs = if p == 0 { 0 } else { *w.ccnt.get_unchecked(p - 1) as usize };
         let ce = *w.ccnt.get_unchecked(p) as usize;
-        sort_small(w.ev.get_unchecked_mut(es..ee), &mut w.tmp_ev, |&x| x);
+        let evs: &[u64] = sort_events(w.ev.get_unchecked_mut(es..ee), &mut w.tmp_ev, &mut w.small);
         if ce - cs > 1 {
             sort_small(w.ck.get_unchecked_mut(cs..ce), &mut w.tmp_ck, |c| c.key);
         }
-        let evs = w.ev.get_unchecked(es..ee);
+
         let clicks = w.ck.get_unchecked(cs..ce);
         let nc = clicks.len();
         let name = prefs.get_unchecked(lo_pid as usize + p).get();
@@ -2423,6 +2493,7 @@ fn main() {
                 let cat_names = &cat_names;
                 handles.push(s.spawn(move || {
                     let mut w = PersonWork {
+                        small: [0; 33],
                         cat_sum: vec![0; ctx.ncat],
                         wcnt: vec![0; ctx.ncamp + 1],
                         wpos: vec![0; ctx.ncamp + 1],
@@ -2677,6 +2748,27 @@ mod tests {
             valid += (want != BAD_TS) as u64;
         }
         eprintln!("valid {valid}");
+    }
+
+    #[test]
+    fn rank_sort_matches_sort() {
+        let mut rng = Rng(0x1234_5678_9abc_def1);
+        let mut tmp = Vec::new();
+        let mut small = [0u64; 33];
+        for round in 0..200_000 {
+            let n = 1 + (rng.next() % 40) as usize;
+            let spread = if round % 3 == 0 { 4 } else { 1 << 31 };
+            let mut v: Vec<u64> = (0..n).map(|_| ((rng.next() % spread) << 32) | (rng.next() & 0xFFFF_FFFF)).collect();
+            let mut want: Vec<u64> = v.iter().map(|x| x >> 32).collect();
+            want.sort();
+            let mut ms: Vec<u64> = v.clone();
+            ms.sort();
+            let got = unsafe { sort_events(&mut v, &mut tmp, &mut small) }.to_vec();
+            assert_eq!(got.iter().map(|x| x >> 32).collect::<Vec<_>>(), want, "n={n}");
+            let mut g2 = got.clone();
+            g2.sort();
+            assert_eq!(g2, ms, "same multiset n={n}");
+        }
     }
 
     #[test]
