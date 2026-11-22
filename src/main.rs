@@ -1,3 +1,4 @@
+// Rescore copy of b30 (same code), to measure run-to-run variance.
 // Shopping Sessions pipeline: native, multithreaded, std only.
 // Reads $DATA_DIR, writes Parquet to $OUTPUT_DIR/user_daily and $OUTPUT_DIR/campaign_daily.
 
