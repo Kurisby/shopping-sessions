@@ -834,7 +834,9 @@ impl Flat {
         }
         if self.qcum.capacity() < nb + 2 {
             self.qcum = Vec::with_capacity(nb + 2);
-            self.qm = Vec::with_capacity(nb + 2);
+        }
+        if self.qm.capacity() < nb + 8 {
+            self.qm = Vec::with_capacity(nb + 8);
         }
         let ip = self.idx.as_mut_ptr();
         let np = self.nl.as_mut_ptr();
@@ -900,7 +902,9 @@ impl Flat {
             *np.add(m + k) = len as u32;
         }
         *qc.add(nb) = qsum;
-        *qmp.add(nb) = 0;
+        for k in 0..8 {
+            *qmp.add(nb + k) = 0;
+        }
     }
     #[inline(always)]
     unsafe fn qbefore(&self, off: u32) -> u32 {
@@ -908,6 +912,21 @@ impl Flat {
         let r = off & 63;
         *self.qcum.as_ptr().add(b) + (*self.qm.as_ptr().add(b) & ((1u64 << r) - 1)).count_ones()
     }
+}
+
+/// Strips the quote pair of every field wrapped in one; false when the line has other quotes.
+#[inline(always)]
+unsafe fn strip_quotes<const N: usize>(fp: &mut [*const u8; N], fl: &mut [usize; N], q: u32) -> bool {
+    let mut fq = 0u32;
+    for i in 0..N {
+        let p = fp[i];
+        let n = fl[i];
+        let both = (n >= 2) & (*p == b'"') & (*p.add(n.max(1) - 1) == b'"');
+        fq += both as u32;
+        fp[i] = p.add(both as usize);
+        fl[i] = n - 2 * both as usize;
+    }
+    q == 2 * fq
 }
 
 /// Calls `f` with the N fields (quotes stripped) of every well-formed line of `chunk`
@@ -972,8 +991,47 @@ unsafe fn for_lines<const N: usize>(flat: &mut Flat, chunk: &'static [u8], mut f
                 let sv = _mm256_loadu_si256(s as *const __m256i);
                 let prev = _mm256_permutevar8x32_epi32(sv, _mm256_setr_epi32(0, 0, 1, 2, 3, 4, 5, 6));
                 let prev = _mm256_blend_epi32::<1>(prev, _mm256_set1_epi32(ls as i32 - 1));
-                let starts = _mm256_sub_epi32(prev, _mm256_set1_epi32(-1));
-                let lens = _mm256_sub_epi32(sv, starts);
+                let mut starts = _mm256_sub_epi32(prev, _mm256_set1_epi32(-1));
+                let mut lens = _mm256_sub_epi32(sv, starts);
+                // the line's '\n' is no quote, so quotes before the next line = quotes before `last`
+                let ql = flat.qbefore(last);
+                let q = ql - qls;
+                qls = ql;
+                let lsl = ls;
+                ls = last + 1;
+                j += N;
+                let mut slow = false;
+                if q != 0 {
+                    if last - lsl < 250 {
+                        // quote bits of the line's 256 bytes from lsl, as 8 x 32-bit words
+                        let qp = flat.qm.as_ptr().add((lsl >> 6) as usize) as *const __m256i;
+                        let r = (lsl & 63) as i64;
+                        let w = _mm256_or_si256(
+                            _mm256_srl_epi64(_mm256_loadu_si256(qp), _mm_cvtsi64_si128(r)),
+                            _mm256_sll_epi64(_mm256_loadu_si256((qp as *const u64).add(1) as *const __m256i), _mm_cvtsi64_si128(64 - r)),
+                        );
+                        let rs = _mm256_sub_epi32(starts, _mm256_set1_epi32(lsl as i32));
+                        let re = _mm256_sub_epi32(sv, _mm256_set1_epi32(lsl as i32 + 1));
+                        let m31 = _mm256_set1_epi32(31);
+                        let fb = _mm256_srlv_epi32(_mm256_permutevar8x32_epi32(w, _mm256_srli_epi32::<5>(rs)), _mm256_and_si256(rs, m31));
+                        let lb = _mm256_srlv_epi32(_mm256_permutevar8x32_epi32(w, _mm256_srli_epi32::<5>(re)), _mm256_and_si256(re, m31));
+                        let lane1 = if N == 7 { _mm256_setr_epi32(1, 1, 1, 1, 1, 1, 1, 0) } else { _mm256_setr_epi32(1, 1, 1, 1, 0, 0, 0, 0) };
+                        // fields wrapped in a quote pair lose it; the line is well-formed only
+                        // if those pairs are all its quotes
+                        let both = _mm256_and_si256(
+                            _mm256_and_si256(fb, lb),
+                            _mm256_and_si256(_mm256_cmpgt_epi32(lens, _mm256_set1_epi32(1)), lane1),
+                        );
+                        let fq = (_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_slli_epi32::<31>(both))) as u32).count_ones();
+                        if q != 2 * fq {
+                            continue;
+                        }
+                        starts = _mm256_add_epi32(starts, both);
+                        lens = _mm256_sub_epi32(lens, _mm256_add_epi32(both, both));
+                    } else {
+                        slow = true;
+                    }
+                }
                 let bv = _mm256_set1_epi64x(base as i64);
                 let fpp = fp.as_mut_ptr() as *mut __m256i;
                 let flp = fl.as_mut_ptr() as *mut __m256i;
@@ -984,6 +1042,9 @@ unsafe fn for_lines<const N: usize>(flat: &mut Flat, chunk: &'static [u8], mut f
                     _mm256_storeu_si256(fpp.add(1), _mm256_add_epi64(bv, _mm256_cvtepu32_epi64(_mm256_extracti128_si256::<1>(starts))));
                     _mm256_storeu_si256(flp.add(1), _mm256_cvtepu32_epi64(_mm256_extracti128_si256::<1>(lens)));
                 }
+                if slow && !strip_quotes(fp, fl, q) {
+                    continue;
+                }
             } else {
                 fp[0] = base.add(ls as usize);
                 fl[0] = (*s - ls) as usize;
@@ -992,26 +1053,12 @@ unsafe fn for_lines<const N: usize>(flat: &mut Flat, chunk: &'static [u8], mut f
                     fp[i] = base.add(a as usize);
                     fl[i] = (*s.add(i) - a) as usize;
                 }
-            }
-            // the line's '\n' is no quote, so quotes before the next line = quotes before `last`
-            let ql = flat.qbefore(last);
-            let q = ql - qls;
-            qls = ql;
-            ls = last + 1;
-            j += N;
-            if q != 0 {
-                // fields wrapped in a quote pair lose it; the line is well-formed only
-                // if those pairs are all its quotes
-                let mut fq = 0u32;
-                for i in 0..N {
-                    let p = fp[i];
-                    let n = fl[i];
-                    let both = (n >= 2) & (*p == b'"') & (*p.add(n.max(1) - 1) == b'"');
-                    fq += both as u32;
-                    fp[i] = p.add(both as usize);
-                    fl[i] = n - 2 * both as usize;
-                }
-                if q != 2 * fq {
+                let ql = flat.qbefore(last);
+                let q = ql - qls;
+                qls = ql;
+                ls = last + 1;
+                j += N;
+                if q != 0 && !strip_quotes(fp, fl, q) {
                     continue;
                 }
             }
@@ -2590,4 +2637,88 @@ mod tests {
         }
         eprintln!("valid {valid}");
     }
+
+    fn ref_fields(line: &[u8], n: usize) -> Option<Vec<Vec<u8>>> {
+        let f: Vec<&[u8]> = line.split(|&c| c == b',').collect();
+        if f.len() != n {
+            return None;
+        }
+        let mut out = Vec::new();
+        for x in f {
+            let mut x = x;
+            if x.contains(&b'"') {
+                if x.len() < 2 || x[0] != b'"' || x[x.len() - 1] != b'"' || x[1..x.len() - 1].contains(&b'"') {
+                    return None;
+                }
+                x = &x[1..x.len() - 1];
+            }
+            out.push(x.to_vec());
+        }
+        Some(out)
+    }
+
+    fn check_lines<const N: usize>(chunk: &[u8]) {
+        let mut pad = chunk.to_vec();
+        pad.extend_from_slice(&[0u8; 128]);
+        let pad: &'static [u8] = Box::leak(pad.into_boxed_slice());
+        let c = &pad[..chunk.len()];
+        let mut want = Vec::new();
+        let mut ls: Vec<&[u8]> = chunk.split(|&b| b == b'\n').collect();
+        if chunk.ends_with(b"\n") || chunk.is_empty() {
+            ls.pop();
+        }
+        for l in ls {
+            if let Some(f) = ref_fields(l, N) {
+                want.push(f);
+            }
+        }
+        let mut got = Vec::new();
+        let mut flat = Flat::new();
+        unsafe {
+            for_lines::<N>(&mut flat, c, |fp, fl| {
+                got.push((0..N).map(|i| sl(fp[i], fl[i]).to_vec()).collect::<Vec<_>>());
+            });
+        }
+        assert_eq!(got.len(), want.len(), "chunk {:?}", String::from_utf8_lossy(chunk));
+        assert!(got == want, "chunk {:?}", String::from_utf8_lossy(chunk));
+    }
+
+    #[test]
+    fn fuzz_lines() {
+        let mut r = Rng(0x1234_5678_9ABC_DEF1);
+        let alpha = b"ab\",,,\"\"x9\n";
+        for it in 0..60_000u64 {
+            let mut chunk = Vec::new();
+            let nl = 1 + r.next() % 40;
+            for _ in 0..nl {
+                let nf = if r.next() % 4 == 0 { 1 + r.next() % 9 } else if it & 1 == 0 { 7 } else { 4 };
+                for f in 0..nf {
+                    if f > 0 {
+                        chunk.push(b',');
+                    }
+                    let kind = r.next() % 6;
+                    let len = match r.next() % 10 { 0 => 0, 1 => 1, 2 => 2, 9 => (r.next() % 300) as usize, _ => (r.next() % 12) as usize };
+                    let mut body: Vec<u8> = (0..len).map(|_| if kind == 0 { alpha[(r.next() % alpha.len() as u64) as usize] } else { b'a' + (r.next() % 26) as u8 }).collect();
+                    if kind == 0 { body.retain(|&b| b != b'\n' || r.next() % 8 == 0); }
+                    if kind >= 3 && kind < 5 {
+                        chunk.push(b'"');
+                        chunk.extend_from_slice(&body);
+                        chunk.push(b'"');
+                    } else {
+                        chunk.extend_from_slice(&body);
+                    }
+                }
+                chunk.push(b'\n');
+            }
+            if r.next() % 3 == 0 {
+                chunk.pop();
+            }
+            if it & 1 == 0 {
+                check_lines::<7>(&chunk);
+            } else {
+                check_lines::<4>(&chunk);
+            }
+        }
+    }
+
 }
