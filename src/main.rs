@@ -1732,6 +1732,7 @@ struct Ctx {
     ndays: usize,
     ids: Ids,
     pshift: u32,
+    vec_window: bool, // every relative time (and it minus 7 days) fits an i32
 }
 
 const EB_BITS: u32 = 11;
@@ -2060,6 +2061,7 @@ struct PersonWork {
     ck: Vec<CKey>, // grouped by person
     tmp_ev: Vec<u64>,
     tmp_ck: Vec<CKey>,
+    brk: Vec<u64>, // session-start bits of the person being walked, then their purchase bits
 }
 
 /// Sorts by the key's high 32 bits (times; ties in any order are fine for every caller).
@@ -2365,9 +2367,6 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
 
     TM[1].fetch_add(tq.elapsed().as_nanos() as u64, Relaxed);
     let tq = Instant::now();
-    let base = ctx.base;
-    let ndays = ctx.ndays;
-    let organic = ctx.ncamp;
     let prefs = ctx.ids.prefs;
     w.plist.clear();
     {
@@ -2402,6 +2401,8 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
         let cs = if p == 0 { 0 } else { *w.ccnt.get_unchecked(p - 1) as usize };
         let ce = *w.ccnt.get_unchecked(p) as usize;
         let evs: &[u64] = sort_events(w.ev.get_unchecked_mut(es..ee), &mut w.tmp_ev, &mut w.small);
+        // detached from w (the walk touches none of ev, tmp_ev, small)
+        let evs: &[u64] = std::slice::from_raw_parts(evs.as_ptr(), evs.len());
         let ncl = ce - cs;
         if ncl > 1 {
             if ncl <= 32 {
@@ -2420,129 +2421,279 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
             }
         }
 
-        let clicks = w.ck.get_unchecked(cs..ce);
-        let nc = clicks.len();
+        let nc = ce - cs;
         let name = prefs.get_unchecked(lo_pid as usize + p).get();
         put_str(&mut ud.names, name);
         ud.nnames += 1;
-        let n = evs.len();
-        let mut lo = 0usize;
-        let mut hi = 0usize;
-        let mut cur_day: i64 = i64::MIN;
-        let mut d_sessions = 0i64;
-        let mut d_events = 0i64;
-        let mut d_rev = 0i64;
-        let mut d_purch = false;
-        // assisted sessions are counted lazily: an active campaign c owes `sc - since[c]`
-        // sessions to the current day, paid when it leaves the window, the day changes or the
-        // person ends (so a session costs nothing per active campaign)
-        let mut sc = 0u32;
-        let mut k = 0usize;
-        while k < n {
-            let start = (*evs.get_unchecked(k) >> 32) as u32;
-            let mut prev = start;
-            let mut rev = 0i64;
-            let mut m = k;
-            let day = (base + start as i64).div_euclid(DAY);
-            if day != cur_day {
-                if cur_day != i64::MIN {
-                    flush_day(ud, (cur_day - ctx.first_day) as u32, d_sessions, d_events, d_rev, d_purch, &mut w.cat_sum, cat_names);
-                    let od = (cur_day - ctx.first_day) as usize;
+        if nc == 0 {
+            walk_person::<0>(ctx, w, ud, evs, cs, ce, cat_names);
+        } else if nc <= 8 && ctx.vec_window {
+            walk_person::<1>(ctx, w, ud, evs, cs, ce, cat_names);
+        } else {
+            walk_person::<2>(ctx, w, ud, evs, cs, ce, cat_names);
+        }
+    }
+    TM[2].fetch_add(tq.elapsed().as_nanos() as u64, Relaxed);
+}
+
+/// One person's walk over their sorted events: sessions (a gap over 30 minutes starts one),
+/// per-day totals, last-touch credit and assisted counts. Clicks are w.ck[cs..ce], sorted.
+/// MODE 0: no clicks. MODE 1: 1..=8 clicks, the 7-day window of each session found with one
+/// vector compare (no branch per click). MODE 2: more clicks, a sliding window with lazy
+/// assisted counts (an active campaign c owes `sc - since[c]` sessions to the current day,
+/// paid when it leaves the window, the day changes or the person ends).
+#[inline(always)]
+unsafe fn walk_person<const MODE: u8>(ctx: &Ctx, w: &mut PersonWork, ud: &mut UserDaily, evs: &[u64], cs: usize, ce: usize, cat_names: &[Vec<u8>]) {
+    let base = ctx.base;
+    let ndays = ctx.ndays;
+    let organic = ctx.ncamp;
+    let n = evs.len();
+    // session starts and purchases as bits (bit n of each is a sentinel), 4 events per vector
+    // step: the session loop below then has no branch per event
+    let nw = n / 64 + 1;
+    if w.brk.len() < 2 * nw {
+        w.brk.resize(2 * nw, 0);
+    }
+    let bp = w.brk.as_mut_ptr();
+    let pw = bp.add(nw);
+    {
+        let ep = evs.as_ptr();
+        let gap = _mm256_set1_epi64x(GAP as i64);
+        let pmask = _mm256_set1_epi64x(0xFFFF_FF00);
+        let zero = _mm256_setzero_si256();
+        let mut bw = 0u64;
+        let mut pbits = 0u64;
+        let mut i = 0usize;
+        while i < n {
+            let (cur, prv) = if i + 4 <= n && i > 0 {
+                (_mm256_loadu_si256(ep.add(i) as *const __m256i), _mm256_loadu_si256(ep.add(i - 1) as *const __m256i))
+            } else {
+                // first or last group: masked loads (lanes past n read as 0: no break, no purchase)
+                let lane = _mm256_setr_epi64x(0, 1, 2, 3);
+                let lim = _mm256_set1_epi64x((n - i) as i64);
+                let lm = _mm256_cmpgt_epi64(lim, lane);
+                let cur = _mm256_maskload_epi64(ep.add(i) as *const i64, lm);
+                let prv = if i == 0 {
+                    _mm256_permute4x64_epi64::<0b10_01_00_00>(cur)
+                } else {
+                    _mm256_maskload_epi64(ep.add(i - 1) as *const i64, lm)
+                };
+                (cur, prv)
+            };
+            let d = _mm256_sub_epi64(_mm256_srli_epi64::<32>(cur), _mm256_srli_epi64::<32>(prv));
+            let b4 = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpgt_epi64(d, gap))) as u64;
+            let np4 = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_and_si256(cur, pmask), zero))) as u64;
+            bw |= b4 << (i & 63);
+            pbits |= (np4 ^ 0xF) << (i & 63);
+            i += 4;
+            if (i & 63) == 0 || i >= n {
+                *bp.add((i - 1) >> 6) = bw;
+                *pw.add((i - 1) >> 6) = pbits;
+                bw = 0;
+                pbits = 0;
+            }
+        }
+        // (i - 1) >> 6 reached n >> 6 unless n is a multiple of 64: then its word is new
+        if n & 63 == 0 {
+            *bp.add(n >> 6) = 0;
+            *pw.add(n >> 6) = 0;
+        }
+        *bp.add(n >> 6) |= 1u64 << (n & 63);
+        *pw.add(n >> 6) |= 1u64 << (n & 63);
+    }
+    // MODE 1: clicks as 8 vector lanes
+    let mut tsv = _mm256_setzero_si256();
+    let mut cmv = _mm256_setzero_si256();
+    let mut campa = [organic as u32; 8];
+    let mut lt = [organic as u32; 9];
+    let mut cntv = _mm256_setzero_si256();
+    let nc = ce - cs;
+    if MODE == 1 {
+        let ck = w.ck.get_unchecked_mut(cs..ce);
+        // ties in time ordered by click ID, descending: the last in-window click is then the
+        // last touch (latest, and the smallest ID among the latest)
+        for i in 1..nc {
+            let mut j = i;
+            while j > 0 && (ck.get_unchecked(j - 1).key >> 32) == (ck.get_unchecked(j).key >> 32) && deref(ck.get_unchecked(j - 1).kref) < deref(ck.get_unchecked(j).kref) {
+                ck.swap(j - 1, j);
+                j -= 1;
+            }
+        }
+        let mut tsa = [i32::MAX; 8];
+        for i in 0..nc {
+            tsa[i] = (ck.get_unchecked(i).key >> 32) as i32;
+            campa[i] = ck.get_unchecked(i).key as u32;
+        }
+        // lane i (the first click of its campaign) gets the mask of that campaign's clicks
+        let mut cma = [0u32; 8];
+        for i in 0..nc {
+            let mut eq = 0u32;
+            for j in 0..nc {
+                eq |= ((campa[j] == campa[i]) as u32) << j;
+            }
+            let first = eq.trailing_zeros() as usize == i;
+            cma[i] = eq & 0u32.wrapping_sub(first as u32);
+        }
+        for i in 0..nc {
+            lt[i + 1] = campa[i];
+        }
+        tsv = _mm256_loadu_si256(tsa.as_ptr() as *const __m256i);
+        cmv = _mm256_loadu_si256(cma.as_ptr() as *const __m256i);
+    }
+    let clicks = w.ck.get_unchecked(cs..ce);
+    let ones = _mm256_set1_epi32(-1);
+    let mut lo = 0usize;
+    let mut hi = 0usize;
+    let mut cur_day: i64 = i64::MIN;
+    let mut d_sessions = 0i64;
+    let mut d_events = 0i64;
+    let mut d_rev = 0i64;
+    let mut d_purch = false;
+    let mut sc = 0u32;
+    let mut pwi = 0usize;
+    let mut pword = *pw;
+    while pword == 0 {
+        pwi += 1;
+        pword = *pw.add(pwi);
+    }
+    let mut pnext = pwi * 64 + pword.trailing_zeros() as usize;
+    let mut wi = 0usize;
+    let mut word = *bp;
+    let mut k = 0usize;
+    while k < n {
+        while word == 0 {
+            wi += 1;
+            word = *bp.add(wi);
+        }
+        let m = wi * 64 + word.trailing_zeros() as usize;
+        word &= word.wrapping_sub(1);
+        let start = (*evs.get_unchecked(k) >> 32) as u32;
+        let day = (base + start as i64).div_euclid(DAY);
+        if day != cur_day {
+            if cur_day != i64::MIN {
+                flush_day(ud, (cur_day - ctx.first_day) as u32, d_sessions, d_events, d_rev, d_purch, &mut w.cat_sum, cat_names);
+                let od = (cur_day - ctx.first_day) as usize;
+                if MODE == 1 {
+                    let mut cnt = [0u32; 8];
+                    _mm256_storeu_si256(cnt.as_mut_ptr() as *mut __m256i, cntv);
+                    for i in 0..nc {
+                        *w.assisted.get_unchecked_mut(campa[i] as usize * ndays + od) += cnt[i];
+                    }
+                    cntv = _mm256_setzero_si256();
+                } else if MODE == 2 {
                     for &c in w.active.iter() {
                         let c = c as usize;
                         *w.assisted.get_unchecked_mut(c * ndays + od) += sc - *w.since.get_unchecked(c);
                         *w.since.get_unchecked_mut(c) = sc;
                     }
                 }
-                cur_day = day;
-                d_sessions = 0;
-                d_events = 0;
-                d_rev = 0;
-                d_purch = false;
             }
-            while m < n {
-                let r = *evs.get_unchecked(m);
-                let t = (r >> 32) as u32;
-                if t - prev > GAP {
-                    break;
-                }
-                prev = t;
-                let pc = r as u32;
-                let price = (pc >> 8) as i64;
-                if price > 0 {
-                    rev += price;
-                    *w.cat_sum.get_unchecked_mut((pc & 0xFF) as usize) += price as u64;
-                    d_purch = true;
-                }
-                m += 1;
-            }
-            d_sessions += 1;
-            d_events += (m - k) as i64;
-            d_rev += rev;
-            let dayidx = (day - ctx.first_day) as usize;
-            let camp = if nc == 0 {
-                organic
-            } else {
-                // slide the 7-day click window [start - 7d, start]
-                while hi < nc && ((clicks.get_unchecked(hi).key >> 32) as u32) <= start {
-                    let c = clicks.get_unchecked(hi).key as u32 as usize;
-                    let x = *w.wcnt.get_unchecked(c);
-                    if x == 0 {
-                        *w.wpos.get_unchecked_mut(c) = w.active.len() as u32;
-                        *w.since.get_unchecked_mut(c) = sc;
-                        w.active.push(c as u32);
-                    }
-                    *w.wcnt.get_unchecked_mut(c) = x + 1;
-                    hi += 1;
-                }
-                let low = start - WEEK as u32;
-                while lo < hi && ((clicks.get_unchecked(lo).key >> 32) as u32) < low {
-                    let c = clicks.get_unchecked(lo).key as u32 as usize;
-                    let x = *w.wcnt.get_unchecked(c) - 1;
-                    *w.wcnt.get_unchecked_mut(c) = x;
-                    if x == 0 {
-                        *w.assisted.get_unchecked_mut(c * ndays + dayidx) += sc - *w.since.get_unchecked(c);
-                        let pos = *w.wpos.get_unchecked(c) as usize;
-                        let last = w.active.pop().unwrap_unchecked();
-                        if last as usize != c {
-                            *w.active.get_unchecked_mut(pos) = last;
-                            *w.wpos.get_unchecked_mut(last as usize) = pos as u32;
-                        }
-                    }
-                    lo += 1;
-                }
-                if hi > lo {
-                    let mut bi = hi - 1;
-                    let t = clicks.get_unchecked(bi).key >> 32;
-                    let mut x = bi;
-                    while x > lo && (clicks.get_unchecked(x - 1).key >> 32) == t {
-                        x -= 1;
-                        if deref(clicks.get_unchecked(x).kref) < deref(clicks.get_unchecked(bi).kref) {
-                            bi = x;
-                        }
-                    }
-                    (clicks.get_unchecked(bi).key as u32) as usize
-                } else {
-                    organic
-                }
-            };
-            let cc = w.credited.get_unchecked_mut(camp * ndays + dayidx);
-            cc[0] += 1;
-            cc[1] += (rev > 0) as i64;
-            cc[2] += rev;
-            sc += 1;
-            k = m;
+            cur_day = day;
+            d_sessions = 0;
+            d_events = 0;
+            d_rev = 0;
+            d_purch = false;
         }
-        let ld = (cur_day - ctx.first_day) as usize;
+        let mut rev = 0i64;
+        while pnext < m {
+            let pc = *evs.get_unchecked(pnext) as u32;
+            let price = (pc >> 8) as i64;
+            rev += price;
+            *w.cat_sum.get_unchecked_mut((pc & 0xFF) as usize) += price as u64;
+            pword &= pword.wrapping_sub(1);
+            while pword == 0 {
+                pwi += 1;
+                pword = *pw.add(pwi);
+            }
+            pnext = pwi * 64 + pword.trailing_zeros() as usize;
+        }
+        d_purch |= rev > 0;
+        d_sessions += 1;
+        d_events += (m - k) as i64;
+        d_rev += rev;
+        let dayidx = (day - ctx.first_day) as usize;
+        let camp = if MODE == 0 {
+            organic
+        } else if MODE == 1 {
+            // in window: start - 7d <= ts <= start (padding lanes hold i32::MAX: never)
+            let out = _mm256_or_si256(
+                _mm256_cmpgt_epi32(tsv, _mm256_set1_epi32(start as i32)),
+                _mm256_cmpgt_epi32(_mm256_set1_epi32((start - WEEK as u32) as i32), tsv),
+            );
+            let inw = !(_mm256_movemask_ps(_mm256_castsi256_ps(out)) as u32) & 0xFF;
+            // campaigns with a click in the window: one more session each
+            let inact = _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32(inw as i32), cmv), _mm256_setzero_si256());
+            cntv = _mm256_sub_epi32(cntv, _mm256_andnot_si256(inact, ones));
+            // the last in-window click's campaign (lt[0]: organic, when none is in it)
+            *lt.get_unchecked((32 - inw.leading_zeros()) as usize) as usize
+        } else {
+            let nc = clicks.len();
+            // slide the 7-day click window [start - 7d, start]
+            while hi < nc && ((clicks.get_unchecked(hi).key >> 32) as u32) <= start {
+                let c = clicks.get_unchecked(hi).key as u32 as usize;
+                let x = *w.wcnt.get_unchecked(c);
+                if x == 0 {
+                    *w.wpos.get_unchecked_mut(c) = w.active.len() as u32;
+                    *w.since.get_unchecked_mut(c) = sc;
+                    w.active.push(c as u32);
+                }
+                *w.wcnt.get_unchecked_mut(c) = x + 1;
+                hi += 1;
+            }
+            let low = start - WEEK as u32;
+            while lo < hi && ((clicks.get_unchecked(lo).key >> 32) as u32) < low {
+                let c = clicks.get_unchecked(lo).key as u32 as usize;
+                let x = *w.wcnt.get_unchecked(c) - 1;
+                *w.wcnt.get_unchecked_mut(c) = x;
+                if x == 0 {
+                    *w.assisted.get_unchecked_mut(c * ndays + dayidx) += sc - *w.since.get_unchecked(c);
+                    let pos = *w.wpos.get_unchecked(c) as usize;
+                    let last = w.active.pop().unwrap_unchecked();
+                    if last as usize != c {
+                        *w.active.get_unchecked_mut(pos) = last;
+                        *w.wpos.get_unchecked_mut(last as usize) = pos as u32;
+                    }
+                }
+                lo += 1;
+            }
+            if hi > lo {
+                let mut bi = hi - 1;
+                let t = clicks.get_unchecked(bi).key >> 32;
+                let mut x = bi;
+                while x > lo && (clicks.get_unchecked(x - 1).key >> 32) == t {
+                    x -= 1;
+                    if deref(clicks.get_unchecked(x).kref) < deref(clicks.get_unchecked(bi).kref) {
+                        bi = x;
+                    }
+                }
+                (clicks.get_unchecked(bi).key as u32) as usize
+            } else {
+                organic
+            }
+        };
+        let cc = w.credited.get_unchecked_mut(camp * ndays + dayidx);
+        cc[0] += 1;
+        cc[1] += (rev > 0) as i64;
+        cc[2] += rev;
+        sc += 1;
+        k = m;
+    }
+    let ld = (cur_day - ctx.first_day) as usize;
+    if MODE == 1 {
+        let mut cnt = [0u32; 8];
+        _mm256_storeu_si256(cnt.as_mut_ptr() as *mut __m256i, cntv);
+        for i in 0..nc {
+            *w.assisted.get_unchecked_mut(campa[i] as usize * ndays + ld) += cnt[i];
+        }
+    } else if MODE == 2 {
         for &c in w.active.iter() {
             let c = c as usize;
             *w.assisted.get_unchecked_mut(c * ndays + ld) += sc - *w.since.get_unchecked(c);
             *w.wcnt.get_unchecked_mut(c) = 0;
         }
         w.active.clear();
-        flush_day(ud, (cur_day - ctx.first_day) as u32, d_sessions, d_events, d_rev, d_purch, &mut w.cat_sum, cat_names);
     }
-    TM[2].fetch_add(tq.elapsed().as_nanos() as u64, Relaxed);
+    flush_day(ud, (cur_day - ctx.first_day) as u32, d_sessions, d_events, d_rev, d_purch, &mut w.cat_sum, cat_names);
 }
 
 #[inline]
@@ -2746,7 +2897,7 @@ fn main() {
         lap("links");
         let pshift = ids.bits.saturating_sub(NPB.trailing_zeros());
         let npb = 1usize << (ids.bits - pshift);
-        let ctx = Ctx { ws, we, base, products, campaigns, ncat: cat_names.len(), unknown_cat, ncamp, first_day, ndays, ids, pshift };
+        let ctx = Ctx { ws, we, base, products, campaigns, ncat: cat_names.len(), unknown_cat, ncamp, first_day, ndays, ids, pshift, vec_window: we - base < (1i64 << 31) };
 
         // ---- phase 1: parse events and clicks
         // arenas sized for twice a thread's share; a busier thread takes another region
@@ -2966,6 +3117,7 @@ fn main() {
                         ck: Vec::new(),
                         tmp_ev: Vec::new(),
                         tmp_ck: Vec::new(),
+                        brk: Vec::new(),
                     };
                     let mut ud = UserDaily::new(est_rows / 9 / nthreads + 1024);
                     loop {
