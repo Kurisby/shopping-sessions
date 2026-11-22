@@ -32,7 +32,7 @@ const MADV_DONTNEED: i32 = 4;
 /// Big mappings (start, len), released in parallel before exit so the kernel's
 /// single-threaded teardown has little left to do.
 static REGIONS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
-static NO_THP: AtomicBool = AtomicBool::new(false);
+static NO_THP: AtomicBool = AtomicBool::new(true); // experiment: no huge pages
 
 fn note_region(p: *mut u8, len: usize) {
     REGIONS.lock().unwrap().push((p as usize, len));
