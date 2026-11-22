@@ -8,7 +8,7 @@ COPY src ./src
 # Branches kept inside 32-byte windows: Skylake-family cores (the scorer is Cascade Lake)
 # take a front-end penalty on jumps that cross or end on one (the JCC erratum fix), and
 # without this a change anywhere can move a hot loop onto such a boundary.
-ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+aes -C llvm-args=-x86-branches-within-32B-boundaries"
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+aes -C llvm-args=-x86-branches-within-32B-boundaries -C llvm-args=-align-loops=32"
 RUN cargo build --release --locked && strip target/release/pipeline
 
 FROM debian:bookworm-slim
