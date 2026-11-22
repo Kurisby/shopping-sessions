@@ -729,7 +729,8 @@ unsafe fn parse_f12_simd<const F2: bool>(p: *const u8) -> i64 {
     let sign = *p.add(19);
     let w3 = std::ptr::read_unaligned(p.add(20) as *const u64) & 0xFF_FFFF_FFFF;
     let x3 = (w3 & !0xFF_0000) | 0x30_0000 | 0x3030_3000_0000_0000;
-    if (sign != b'+' && sign != b'-') | ((w3 >> 16) & 0xFF != b':' as u64) | !all_digits(x3) {
+    // `&`, not `&&`: the sign is random, so a short-circuit branch on it would mispredict
+    if ((sign != b'+') & (sign != b'-')) | ((w3 >> 16) & 0xFF != b':' as u64) | !all_digits(x3) {
         return BAD_TS;
     }
     let oh = ((w3 & 0xFF) - 0x30) * 10 + ((w3 >> 8) & 0xFF) - 0x30;
@@ -738,11 +739,9 @@ unsafe fn parse_f12_simd<const F2: bool>(p: *const u8) -> i64 {
         return BAD_TS;
     }
     let off = ((oh * 60 + om) * 60_000) as i64;
-    if sign == b'+' {
-        ms - off
-    } else {
-        ms + off
-    }
+    // ms - off for '+', ms + off for '-', without a branch
+    let neg = -((sign == b'+') as i64);
+    ms + ((off ^ neg) - neg)
 }
 
 /// `parse_f12_simd::<false>` in whole seconds (BAD_TS when bad): the `Z` form has no
@@ -2046,6 +2045,7 @@ struct CKey {
 
 struct PersonWork {
     small: [u64; 33],
+    small_ck: [CKey; 33],
     cat_sum: Vec<u64>,
     wcnt: Vec<u32>,
     wpos: Vec<u32>,
@@ -2217,6 +2217,37 @@ unsafe fn rank_sort<const NB: usize>(v: &[u64], out: &mut [u64; 33]) {
     }
 }
 
+/// `rank_sort` for clicks: 2..=4*NB clicks into `out` in (time, position) order.
+#[inline(always)]
+unsafe fn rank_sort_ck<const NB: usize>(v: &[CKey], out: &mut [CKey; 33]) {
+    let n = v.len();
+    debug_assert!(n >= 1 && n <= 4 * NB);
+    let mut k = [0i64; 32];
+    for i in 0..4 * NB {
+        let x = v.get_unchecked(i.min(n - 1)).key;
+        *k.get_unchecked_mut(i) = if i < n { (((x >> 32) << 5) | i as u64) as i64 } else { i64::MAX };
+    }
+    let kp = k.as_ptr() as *const __m256i;
+    let mut blk = [_mm256_setzero_si256(); NB];
+    let mut acc = [_mm256_setzero_si256(); NB];
+    for m in 0..NB {
+        blk[m] = _mm256_loadu_si256(kp.add(m));
+    }
+    for j in 0..4 * NB {
+        let b = _mm256_set1_epi64x(*k.get_unchecked(j));
+        for m in 0..NB {
+            acc[m] = _mm256_sub_epi64(acc[m], _mm256_cmpgt_epi64(blk[m], b));
+        }
+    }
+    let mut r = [0u64; 32];
+    for m in 0..NB {
+        _mm256_storeu_si256((r.as_mut_ptr() as *mut __m256i).add(m), acc[m]);
+    }
+    for i in 0..4 * NB {
+        *out.get_unchecked_mut(*r.get_unchecked(i) as usize) = *v.get_unchecked(i.min(n - 1));
+    }
+}
+
 #[inline(never)]
 fn radix_hi32<T: Copy>(v: &mut [T], tmp: &mut Vec<T>, key: impl Fn(&T) -> u64) {
     let n = v.len();
@@ -2340,14 +2371,18 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
     let prefs = ctx.ids.prefs;
     w.plist.clear();
     {
+        // persons with events (cnt changes), listed without a branch per slot
+        w.plist.reserve(range);
+        let pl = w.plist.as_mut_ptr();
+        let mut np = 0usize;
         let mut prev = 0u32;
         for p in 0..range {
             let e = *w.cnt.get_unchecked(p);
-            if e != prev {
-                w.plist.push(p as u32);
-            }
+            *pl.add(np) = p as u32;
+            np += (e != prev) as usize;
             prev = e;
         }
+        w.plist.set_len(np);
     }
     let np = w.plist.len();
     for ii in 0..np {
@@ -2367,8 +2402,22 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
         let cs = if p == 0 { 0 } else { *w.ccnt.get_unchecked(p - 1) as usize };
         let ce = *w.ccnt.get_unchecked(p) as usize;
         let evs: &[u64] = sort_events(w.ev.get_unchecked_mut(es..ee), &mut w.tmp_ev, &mut w.small);
-        if ce - cs > 1 {
-            sort_small(w.ck.get_unchecked_mut(cs..ce), &mut w.tmp_ck, |c| c.key);
+        let ncl = ce - cs;
+        if ncl > 1 {
+            if ncl <= 32 {
+                // branch-free, like the events (a comparison sort mispredicts on these)
+                let v = w.ck.get_unchecked_mut(cs..ce);
+                if ncl <= 8 {
+                    rank_sort_ck::<2>(v, &mut w.small_ck);
+                } else if ncl <= 16 {
+                    rank_sort_ck::<4>(v, &mut w.small_ck);
+                } else {
+                    rank_sort_ck::<8>(v, &mut w.small_ck);
+                }
+                v.copy_from_slice(&w.small_ck[..ncl]);
+            } else {
+                sort_small(w.ck.get_unchecked_mut(cs..ce), &mut w.tmp_ck, |c| c.key);
+            }
         }
 
         let clicks = w.ck.get_unchecked(cs..ce);
@@ -2508,10 +2557,10 @@ fn flush_day(ud: &mut UserDaily, dayidx: u32, sessions: i64, events: i64, rev: i
         let mut best = 0usize;
         let mut bv = 0u64;
         for (c, v) in cat_sum.iter_mut().enumerate() {
-            if *v > bv {
-                bv = *v;
-                best = c;
-            }
+            // first maximum, without a branch per category
+            let m = 0u64.wrapping_sub((*v > bv) as u64);
+            bv = (bv & !m) | (*v & m);
+            best = (best & !(m as usize)) | (c & m as usize);
             *v = 0;
         }
         ud.top_def.push(1);
@@ -2902,6 +2951,7 @@ fn main() {
                 handles.push(s.spawn(move || {
                     let mut w = PersonWork {
                         small: [0; 33],
+                        small_ck: [CKey { key: 0, kref: 0 }; 33],
                         cat_sum: vec![0; ctx.ncat],
                         wcnt: vec![0; ctx.ncamp + 1],
                         wpos: vec![0; ctx.ncamp + 1],
