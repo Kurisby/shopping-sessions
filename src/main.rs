@@ -20,7 +20,85 @@ const GAP: u32 = 1_800_000;
 extern "C" {
     fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    fn munmap(addr: *mut u8, len: usize) -> i32;
+    fn mremap(old: *mut u8, old_len: usize, new_len: usize, flags: i32, ...) -> *mut u8;
 }
+
+/// Big heap blocks (>= 1 MB) come straight from mmap with huge pages requested: page
+/// faults are costly on the scorer, and 2 MB pages take 512x fewer of them.
+struct HugeAlloc;
+const BIG: usize = 1 << 20;
+const HUGE: usize = 2 << 20;
+const MREMAP_MAYMOVE: i32 = 1;
+
+#[inline]
+fn big_len(n: usize) -> usize {
+    (n + HUGE - 1) & !(HUGE - 1)
+}
+
+unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
+    #[inline]
+    unsafe fn alloc(&self, l: std::alloc::Layout) -> *mut u8 {
+        if l.size() < BIG || l.align() > 4096 {
+            return std::alloc::System.alloc(l);
+        }
+        let n = big_len(l.size());
+        let p = mmap(std::ptr::null_mut(), n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if p as isize == -1 {
+            return std::ptr::null_mut();
+        }
+        if !NO_THP.load(Relaxed) {
+            madvise(p, n, MADV_HUGEPAGE);
+        }
+        p
+    }
+    #[inline]
+    unsafe fn alloc_zeroed(&self, l: std::alloc::Layout) -> *mut u8 {
+        if l.size() < BIG || l.align() > 4096 {
+            return std::alloc::System.alloc_zeroed(l);
+        }
+        self.alloc(l) // fresh anonymous memory is zero
+    }
+    #[inline]
+    unsafe fn dealloc(&self, p: *mut u8, l: std::alloc::Layout) {
+        if l.size() < BIG || l.align() > 4096 {
+            return std::alloc::System.dealloc(p, l);
+        }
+        munmap(p, big_len(l.size()));
+    }
+    unsafe fn realloc(&self, p: *mut u8, l: std::alloc::Layout, new: usize) -> *mut u8 {
+        let old_big = l.size() >= BIG && l.align() <= 4096;
+        let new_big = new >= BIG && l.align() <= 4096;
+        if old_big && new_big {
+            let (a, b) = (big_len(l.size()), big_len(new));
+            if a == b {
+                return p;
+            }
+            let q = mremap(p, a, b, MREMAP_MAYMOVE);
+            if q as isize == -1 {
+                return std::ptr::null_mut();
+            }
+            if b > a && !NO_THP.load(Relaxed) {
+                madvise(q, b, MADV_HUGEPAGE);
+            }
+            return q;
+        }
+        if !old_big && !new_big {
+            return std::alloc::System.realloc(p, l, new);
+        }
+        // crossing the threshold: allocate, copy, free
+        let nl = std::alloc::Layout::from_size_align_unchecked(new, l.align());
+        let q = self.alloc(nl);
+        if !q.is_null() {
+            std::ptr::copy_nonoverlapping(p, q, l.size().min(new));
+            self.dealloc(p, l);
+        }
+        q
+    }
+}
+
+#[global_allocator]
+static GLOBAL: HugeAlloc = HugeAlloc;
 const PROT_READ: i32 = 1;
 const PROT_WRITE: i32 = 2;
 const MAP_PRIVATE: i32 = 2;
@@ -28,6 +106,7 @@ const MAP_FIXED: i32 = 0x10;
 const MAP_ANON: i32 = 0x20;
 const MADV_HUGEPAGE: i32 = 14;
 const MADV_DONTNEED: i32 = 4;
+
 
 /// Big mappings (start, len), released in parallel before exit so the kernel's
 /// single-threaded teardown has little left to do.
@@ -1624,7 +1703,7 @@ struct PersonWork {
 
 #[inline(always)]
 fn sort_small<T: Copy>(v: &mut [T], key: impl Fn(&T) -> u64) {
-    if v.len() <= 24 {
+    if v.len() <= 1 {
         for i in 1..v.len() {
             let x = v[i];
             let kx = key(&x);
@@ -1654,7 +1733,7 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
             for r in part.iter_mut() {
                 let t = (r.rowid >> 27) as usize;
                 let i = (r.rowid & ((1 << 27) - 1)) as usize;
-                if losers[t][i >> 6].load(Relaxed) & (1u64 << (i & 63)) != 0 {
+                if losers.get_unchecked(t).get_unchecked(i >> 6).load(Relaxed) & (1u64 << (i & 63)) != 0 {
                     r.pid = INVALID;
                 } else {
                     *w.cnt.get_unchecked_mut((r.pid - lo_pid) as usize) += 1;
@@ -1742,6 +1821,10 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
     }
     let np = w.plist.len();
     for ii in 0..np {
+        // two-stage prefetch: the person's prefs entry, then (once cached) the name bytes
+        if ii + 16 < np {
+            _mm_prefetch(prefs.as_ptr().add(lo_pid as usize + *w.plist.get_unchecked(ii + 16) as usize) as *const i8, _MM_HINT_T0);
+        }
         if ii + 6 < np {
             let r = prefs.get_unchecked(lo_pid as usize + *w.plist.get_unchecked(ii + 6) as usize).load(Relaxed);
             _mm_prefetch((r & 0xFFFF_FFFF_FFFF) as *const i8, _MM_HINT_T0);
@@ -2338,6 +2421,11 @@ fn main() {
             parquet::write(&mut bw, n, &cols).unwrap();
         });
         lap("written");
+        if verbose {
+            let st = fs::read_to_string("/proc/self/stat").unwrap_or_default();
+            let f: Vec<&str> = st.rsplit(')').next().unwrap_or("").split_whitespace().collect();
+            eprintln!("  minflt {} majflt {}", f.get(7).unwrap_or(&"?"), f.get(9).unwrap_or(&"?"));
+        }
         if std::env::var("SS_NOREL").is_err() {
             release_regions(nthreads);
             lap("released");
