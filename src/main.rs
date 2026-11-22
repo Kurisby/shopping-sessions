@@ -259,30 +259,30 @@ fn mum(a: u64, b: u64) -> u64 {
     (r as u64) ^ ((r >> 64) as u64)
 }
 
-/// wyhash-style string hash (full 64-bit avalanche; the old multiply-rotate chain
-/// collided on 9-byte IDs that share a prefix). Never returns 0.
-/// Reads up to 7 bytes past the end when n < 8: only for padded memory.
+/// AES-round string hash (AES-NI): rounds are bijections on the 128-bit state, so distinct
+/// IDs of up to 16 bytes never collide before the 64-bit truncation, and 3 rounds spread
+/// every input byte over every output byte. Never returns 0.
+/// Reads up to 15 bytes past the end when n < 16: only for padded memory.
 #[inline(always)]
 unsafe fn hash_ptr(p: *const u8, n: usize) -> u64 {
-    let rd = |i: usize| std::ptr::read_unaligned(p.add(i) as *const u64);
-    let mut seed = S1 ^ n as u64;
-    let (a, b) = if n < 8 {
-        if n == 0 {
-            (0, 0)
-        } else {
-            (rd(0) & (u64::MAX >> (64 - 8 * n)), 0)
-        }
-    } else if n <= 16 {
-        (rd(0), rd(n - 8))
+    let k0 = _mm_set_epi64x(S0 as i64, S1 as i64);
+    let k1 = _mm_set_epi64x(S3 as i64, (S0 ^ n as u64) as i64);
+    let s = if n <= 16 {
+        const IOTA: __m128i = v128([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+        let keep = _mm_cmpgt_epi8(_mm_set1_epi8(n as i8), IOTA);
+        let x = _mm_and_si128(_mm_loadu_si128(p as *const __m128i), keep);
+        _mm_aesenc_si128(_mm_aesenc_si128(_mm_xor_si128(x, k0), k1), k0)
     } else {
-        let mut i = 0;
-        while n - i > 16 {
-            seed = mum(rd(i) ^ S0, rd(i + 8) ^ seed);
+        let mut s = _mm_xor_si128(_mm_loadu_si128(p as *const __m128i), k0);
+        let mut i = 16;
+        while i + 16 < n {
+            s = _mm_aesenc_si128(s, _mm_loadu_si128(p.add(i) as *const __m128i));
             i += 16;
         }
-        (rd(n - 16), rd(n - 8))
+        s = _mm_aesenc_si128(s, _mm_loadu_si128(p.add(n - 16) as *const __m128i));
+        _mm_aesenc_si128(_mm_aesenc_si128(s, k1), k0)
     };
-    let h = mum(S3 ^ n as u64, mum(a ^ S0, b ^ seed));
+    let h = _mm_cvtsi128_si64(_mm_aesenc_si128(s, k1)) as u64;
     if h == 0 {
         1
     } else {
@@ -292,10 +292,10 @@ unsafe fn hash_ptr(p: *const u8, n: usize) -> u64 {
 
 /// Same value as hash_ptr, safe on any slice.
 fn hash_bytes(b: &[u8]) -> u64 {
-    if b.len() >= 8 {
+    if b.len() >= 16 {
         unsafe { hash_ptr(b.as_ptr(), b.len()) }
     } else {
-        let mut buf = [0u8; 8];
+        let mut buf = [0u8; 16];
         buf[..b.len()].copy_from_slice(b);
         unsafe { hash_ptr(buf.as_ptr(), b.len()) }
     }
@@ -2679,6 +2679,28 @@ mod tests {
             valid += (want != BAD_TS) as u64;
         }
         eprintln!("valid {valid}");
+    }
+
+    #[test]
+    fn hash_quality() {
+        let mut r = Rng(0xABCDEF12345);
+        let mut seen = std::collections::HashMap::new();
+        let mut pad = vec![0u8; 128];
+        let alnum = b"0123456789abcdefghijklmnopqrstuvwxyz";
+        for it in 0..3_000_000u64 {
+            let n = match it % 4 { 0 => 9, 1 => 33, 2 => 8, _ => 1 + (r.next() % 48) as usize };
+            let mut v: Vec<u8> = (0..n).map(|_| alnum[(r.next() % if n == 33 { 16 } else { 36 }) as usize]).collect();
+            v[0] = b'u';
+            for (k, b) in pad.iter_mut().enumerate() {
+                *b = if k < n { v[k] } else { (r.next() & 0xFF) as u8 };
+            }
+            let h = unsafe { hash_ptr(pad.as_ptr(), n) };
+            assert_eq!(h, hash_bytes(&v));
+            assert_ne!(h, 0);
+            if let Some(old) = seen.insert(h, v.clone()) {
+                assert_eq!(old, v, "collision");
+            }
+        }
     }
 
     fn ref_fields(line: &[u8], n: usize) -> Option<Vec<Vec<u8>>> {
