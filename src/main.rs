@@ -127,37 +127,41 @@ fn deref(r: u64) -> &'static [u8] {
     unsafe { std::slice::from_raw_parts((r & 0xFFFF_FFFF_FFFF) as *const u8, (r >> 48) as usize) }
 }
 
+const S0: u64 = 0xa0761d6478bd642f;
+const S1: u64 = 0xe7037ed1a0b428db;
+const S3: u64 = 0x589965cc75374cc3;
+
+/// 64x64 -> 128 multiply, folded: every output bit depends on every input bit.
 #[inline(always)]
-fn fmix(mut h: u64) -> u64 {
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xff51afd7ed558ccd);
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xc4ceb9fe1a85ec53);
-    h ^= h >> 33;
-    h
+fn mum(a: u64, b: u64) -> u64 {
+    let r = (a as u128) * (b as u128);
+    (r as u64) ^ ((r >> 64) as u64)
 }
 
-const HK0: u64 = 0x243F6A8885A308D3;
-const HK1: u64 = 0x9E3779B97F4A7C15;
-const HK2: u64 = 0xD6E8FEB86659FD93;
-
-/// Injective for strings of equal length (every step is a bijection); random-like across lengths.
-/// Reads up to 7 bytes past the end: only for padded memory.
+/// wyhash-style string hash (full 64-bit avalanche; the old multiply-rotate chain
+/// collided on 9-byte IDs that share a prefix). Never returns 0.
+/// Reads up to 7 bytes past the end when n < 8: only for padded memory.
 #[inline(always)]
 unsafe fn hash_ptr(p: *const u8, n: usize) -> u64 {
-    let mut h = HK0 ^ (n as u64).wrapping_mul(HK1);
-    let mut i = 0;
-    while i + 8 <= n {
-        let w = std::ptr::read_unaligned(p.add(i) as *const u64);
-        h = (h ^ w).wrapping_mul(HK1).rotate_left(31);
-        i += 8;
-    }
-    if i < n {
-        let r = n - i;
-        let w = std::ptr::read_unaligned(p.add(i) as *const u64) & (u64::MAX >> (64 - 8 * r));
-        h = (h ^ w).wrapping_mul(HK2).rotate_left(29);
-    }
-    let h = fmix(h);
+    let rd = |i: usize| std::ptr::read_unaligned(p.add(i) as *const u64);
+    let mut seed = S1 ^ n as u64;
+    let (a, b) = if n < 8 {
+        if n == 0 {
+            (0, 0)
+        } else {
+            (rd(0) & (u64::MAX >> (64 - 8 * n)), 0)
+        }
+    } else if n <= 16 {
+        (rd(0), rd(n - 8))
+    } else {
+        let mut i = 0;
+        while n - i > 16 {
+            seed = mum(rd(i) ^ S0, rd(i + 8) ^ seed);
+            i += 16;
+        }
+        (rd(n - 16), rd(n - 8))
+    };
+    let h = mum(S3 ^ n as u64, mum(a ^ S0, b ^ seed));
     if h == 0 {
         1
     } else {
@@ -167,29 +171,12 @@ unsafe fn hash_ptr(p: *const u8, n: usize) -> u64 {
 
 /// Same value as hash_ptr, safe on any slice.
 fn hash_bytes(b: &[u8]) -> u64 {
-    let n = b.len();
-    let mut h = HK0 ^ (n as u64).wrapping_mul(HK1);
-    let mut i = 0;
-    while i + 8 <= n {
-        let w = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
-        h = (h ^ w).wrapping_mul(HK1).rotate_left(31);
-        i += 8;
-    }
-    if i < n {
-        let mut w = 0u64;
-        let mut k = 0;
-        while i < n {
-            w |= (b[i] as u64) << k;
-            k += 8;
-            i += 1;
-        }
-        h = (h ^ w).wrapping_mul(HK2).rotate_left(29);
-    }
-    let h = fmix(h);
-    if h == 0 {
-        1
+    if b.len() >= 8 {
+        unsafe { hash_ptr(b.as_ptr(), b.len()) }
     } else {
-        h
+        let mut buf = [0u8; 8];
+        buf[..b.len()].copy_from_slice(b);
+        unsafe { hash_ptr(buf.as_ptr(), b.len()) }
     }
 }
 
@@ -403,6 +390,115 @@ fn parse_price(v: &[u8]) -> Option<u32> {
         None
     } else {
         Some(x)
+    }
+}
+
+
+// ---------------------------------------------------------------- fast timestamp paths
+
+static mut MONTH_START: [i32; 4800] = [0; 4800]; // days since epoch of the 1st, years 1900..2300
+static mut MONTH_LEN: [u8; 4800] = [0; 4800];
+
+fn init_month_tables() {
+    unsafe {
+        for y in 1900..2300i64 {
+            for m in 1..=12i64 {
+                let i = ((y - 1900) * 12 + m - 1) as usize;
+                MONTH_START[i] = days_from_civil(y, m, 1) as i32;
+                MONTH_LEN[i] = match m {
+                    2 => {
+                        if is_leap(y) {
+                            29
+                        } else {
+                            28
+                        }
+                    }
+                    4 | 6 | 9 | 11 => 30,
+                    _ => 31,
+                };
+            }
+        }
+    }
+}
+
+#[inline(always)]
+fn all_digits(x: u64) -> bool {
+    ((x & 0xF0F0F0F0F0F0F0F0) == 0x3030303030303030) & (((x.wrapping_add(0x0606060606060606)) & 0xF0F0F0F0F0F0F0F0) == 0x3030303030303030)
+}
+
+#[inline(always)]
+fn parse8(x: u64) -> u64 {
+    let v = x.wrapping_sub(0x3030303030303030);
+    let v = v.wrapping_mul(10).wrapping_add(v >> 8);
+    (((v & 0x000000FF000000FF).wrapping_mul(100 + (1000000 << 32)))
+        .wrapping_add(((v >> 16) & 0x000000FF000000FF).wrapping_mul(1 + (10000 << 32))))
+        >> 32
+}
+
+const BAD_TS: i64 = i64::MIN;
+
+/// `YYYY-MM-DDTHH:MM:SSZ` (n == 20). Returns BAD_TS when not valid F1.
+#[inline(always)]
+unsafe fn parse_f1(p: *const u8) -> i64 {
+    const S0: u64 = 0xFF0000FF00000000;
+    const E0: u64 = 0x2D00002D00000000;
+    const S1: u64 = 0x0000FF0000FF0000;
+    const E1: u64 = 0x00003A0000540000;
+    const S2: u64 = 0xFF0000FF;
+    const E2: u64 = 0x5A00003A;
+    const Z: u64 = 0x3030303030303030;
+    let w0 = std::ptr::read_unaligned(p as *const u64);
+    let w1 = std::ptr::read_unaligned(p.add(8) as *const u64);
+    let w2 = std::ptr::read_unaligned(p.add(16) as *const u32) as u64;
+    let x0 = (w0 & !S0) | (Z & S0);
+    let x1 = (w1 & !S1) | (Z & S1);
+    let x2 = (w2 & !S2) | (Z & S2) | 0x3030303000000000;
+    let ok = ((w0 & S0) == E0) & ((w1 & S1) == E1) & ((w2 & S2) == E2) & all_digits(x0) & all_digits(x1) & all_digits(x2);
+    if !ok {
+        return BAD_TS;
+    }
+    let v0 = x0.wrapping_sub(Z);
+    let t0 = v0.wrapping_mul(10).wrapping_add(v0 >> 8);
+    let v1 = x1.wrapping_sub(Z);
+    let t1 = v1.wrapping_mul(10).wrapping_add(v1 >> 8);
+    let v2 = x2.wrapping_sub(Z);
+    let t2 = v2.wrapping_mul(10).wrapping_add(v2 >> 8);
+    let year = (t0 & 0xFF) * 100 + ((t0 >> 16) & 0xFF);
+    let month = (t0 >> 40) & 0xFF;
+    let day = t1 & 0xFF;
+    let hour = (t1 >> 24) & 0xFF;
+    let minute = (t1 >> 48) & 0xFF;
+    let second = (t2 >> 8) & 0xFF;
+    if year < 1900 || year >= 2300 || month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59 {
+        if year < 1900 || year >= 2300 {
+            return parse_iso(sl(p, 20)).unwrap_or(BAD_TS);
+        }
+        return BAD_TS;
+    }
+    let idx = ((year - 1900) * 12 + month - 1) as usize;
+    if day < 1 || day > MONTH_LEN[idx] as u64 {
+        return BAD_TS;
+    }
+    ((MONTH_START[idx] as i64 + day as i64 - 1) * 86_400 + (hour * 3600 + minute * 60 + second) as i64) * 1000
+}
+
+/// Any timestamp form; BAD_TS when bad.
+#[inline(always)]
+unsafe fn parse_ts_fast(p: *const u8, n: usize) -> i64 {
+    if n == 20 {
+        return parse_f1(p);
+    }
+    if n == 13 {
+        let a = std::ptr::read_unaligned(p as *const u64);
+        let b = std::ptr::read_unaligned(p.add(5) as *const u64);
+        if all_digits(a) & all_digits(b) {
+            return (parse8(a) * 100_000 + parse8(b) % 100_000) as i64;
+        }
+        return BAD_TS;
+    }
+    match parse_ts(sl(p, n)) {
+        Some(t) => t,
+        None => BAD_TS,
     }
 }
 
@@ -1076,22 +1172,19 @@ unsafe fn parse_events(ctx: &Ctx, chunk: &'static [u8], out: &mut ThreadOut) {
             continue;
         }
         let ehash = hash_ptr(fp[0], fl[0]);
-        let ingest = parse_ts(sl(fp[3], fl[3]));
+        let ingest = parse_ts_fast(fp[3], fl[3]);
         let rowid = (out.tid << 27) | out.rows;
         out.rows += 1;
-        let ingest_rel = match ingest {
-            Some(t) => ((t - base).div_euclid(1000)).clamp(i32::MIN as i64, (i32::MAX - 1) as i64) as i32,
-            None => i32::MAX,
-        };
+        let ingest_rel = if ingest == BAD_TS { i32::MAX } else { ((ingest - base).div_euclid(1000)).clamp(i32::MIN as i64, (i32::MAX - 1) as i64) as i32 };
         out.dk.push(ebucket(ehash), DKey { ehash, ingest: ingest_rel, rowid });
         // validation
         if fl[1] == 0 || fl[5] == 0 {
             continue;
         }
-        let ts = match parse_ts(sl(fp[2], fl[2])) {
-            Some(t) if t >= ws && t < we => t,
-            _ => continue,
-        };
+        let ts = parse_ts_fast(fp[2], fl[2]);
+        if ts < ws || ts >= we {
+            continue;
+        }
         let mut pc = 0u32;
         if fl[4] == 4 {
             let w = std::ptr::read_unaligned(fp[4] as *const u32);
@@ -1111,9 +1204,8 @@ unsafe fn parse_events(ctx: &Ctx, chunk: &'static [u8], out: &mut ThreadOut) {
         } else {
             continue;
         }
-        match ingest {
-            Some(i) if i - ts <= DAY => {}
-            _ => continue,
+        if ingest == BAD_TS || ingest - ts > DAY {
+            continue;
         }
         let uhash = hash_ptr(fp[1], fl[1]);
         out.push_pending(Pending { uhash, uref: mkref(fp[1], fl[1]), a: (ts - base) as u32, b: pc, c: rowid }, ctx);
@@ -1144,10 +1236,10 @@ unsafe fn parse_clicks(ctx: &Ctx, chunk: &'static [u8], out: &mut ThreadOut) {
         if camp == ABSENT {
             continue;
         }
-        let ts = match parse_ts(sl(fp[3], fl[3])) {
-            Some(t) if t >= lo && t < we => t,
-            _ => continue,
-        };
+        let ts = parse_ts_fast(fp[3], fl[3]);
+        if ts < lo || ts >= we {
+            continue;
+        }
         let uhash = hash_ptr(fp[1], fl[1]);
         ring.push(PendingClick { uhash, uref: mkref(fp[1], fl[1]), kref: mkref(fp[0], fl[0]), ts: (ts - lo) as u32, camp }, ctx, out);
     }
@@ -1189,9 +1281,12 @@ struct CKey {
 
 struct PersonWork {
     cat_sum: Vec<u64>,
-    stamp: Vec<u32>,
-    sid: u32,
-    camp_counts: Vec<[i64; 4]>,
+    wcnt: Vec<u32>,
+    wpos: Vec<u32>,
+    active: Vec<u32>,
+    plist: Vec<u32>,
+    credited: Vec<[i64; 3]>,
+    assisted: Vec<u32>,
     cnt: Vec<u32>,
     ccnt: Vec<u32>,
     ev: Vec<u64>,  // ts << 32 | pc, grouped by person
@@ -1216,7 +1311,9 @@ fn sort_small<T: Copy>(v: &mut [T], key: impl Fn(&T) -> u64) {
     }
 }
 
+static TM: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
 unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[ThreadOut], losers: &[&'static [AtomicU64]], b: usize, w: &mut PersonWork, ud: &mut UserDaily) {
+    let tq = Instant::now();
     let range = 1usize << ctx.pshift;
     let lo_pid = (b << ctx.pshift) as u32;
     w.cnt.clear();
@@ -1262,6 +1359,8 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
             }
         }
     }
+    TM[0].fetch_add(tq.elapsed().as_nanos() as u64, Relaxed);
+    let tq = Instant::now();
     // now cnt[p] = end of p; start of p = cnt[p-1] (0 for p = 0)
     // clicks of persons that have events
     w.ccnt.clear();
@@ -1295,25 +1394,42 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
         }
     }
 
+    TM[1].fetch_add(tq.elapsed().as_nanos() as u64, Relaxed);
+    let tq = Instant::now();
     let base = ctx.base;
     let ndays = ctx.ndays;
     let organic = ctx.ncamp;
-    let mut es = 0usize;
-    let mut cs = 0usize;
-    for p in 0..range {
-        let ee = w.cnt[p] as usize;
-        let ce = w.ccnt[p] as usize;
-        if ee == es {
-            cs = ce;
-            continue;
+    let prefs = ctx.ids.prefs;
+    w.plist.clear();
+    {
+        let mut prev = 0u32;
+        for p in 0..range {
+            let e = *w.cnt.get_unchecked(p);
+            if e != prev {
+                w.plist.push(p as u32);
+            }
+            prev = e;
         }
-        sort_small(&mut w.ev[es..ee], |&x| x);
-        sort_small(&mut w.ck[cs..ce], |c| c.key);
-        let evs = &w.ev[es..ee];
-        let clicks = &w.ck[cs..ce];
-        es = ee;
-        cs = ce;
-        let name = deref(ctx.ids.prefs[lo_pid as usize + p].load(Relaxed));
+    }
+    let np = w.plist.len();
+    for ii in 0..np {
+        if ii + 6 < np {
+            let r = prefs.get_unchecked(lo_pid as usize + *w.plist.get_unchecked(ii + 6) as usize).load(Relaxed);
+            _mm_prefetch((r & 0xFFFF_FFFF_FFFF) as *const i8, _MM_HINT_T0);
+        }
+        let p = *w.plist.get_unchecked(ii) as usize;
+        let es = if p == 0 { 0 } else { *w.cnt.get_unchecked(p - 1) as usize };
+        let ee = *w.cnt.get_unchecked(p) as usize;
+        let cs = if p == 0 { 0 } else { *w.ccnt.get_unchecked(p - 1) as usize };
+        let ce = *w.ccnt.get_unchecked(p) as usize;
+        sort_small(w.ev.get_unchecked_mut(es..ee), |&x| x);
+        if ce - cs > 1 {
+            sort_small(w.ck.get_unchecked_mut(cs..ce), |c| c.key);
+        }
+        let evs = w.ev.get_unchecked(es..ee);
+        let clicks = w.ck.get_unchecked(cs..ce);
+        let nc = clicks.len();
+        let name = deref(prefs.get_unchecked(lo_pid as usize + p).load(Relaxed));
         let n = evs.len();
         let mut lo = 0usize;
         let mut hi = 0usize;
@@ -1324,7 +1440,7 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
         let mut d_purch = false;
         let mut k = 0usize;
         while k < n {
-            let start = (evs[k] >> 32) as u32;
+            let start = (*evs.get_unchecked(k) >> 32) as u32;
             let mut prev = start;
             let mut rev = 0i64;
             let mut m = k;
@@ -1340,7 +1456,7 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
                 d_purch = false;
             }
             while m < n {
-                let r = evs[m];
+                let r = *evs.get_unchecked(m);
                 let t = (r >> 32) as u32;
                 if t - prev > GAP {
                     break;
@@ -1358,54 +1474,69 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
             d_sessions += 1;
             d_events += (m - k) as i64;
             d_rev += rev;
-            let start_key = ((start as u64) << 32) | 0xFFFF_FFFF;
-            while hi < clicks.len() && clicks[hi].key <= start_key {
-                hi += 1;
-            }
-            let low_bound = (start as i64 - WEEK).max(0) as u64;
-            while lo < hi && (clicks[lo].key >> 32) < low_bound {
-                lo += 1;
-            }
             let dayidx = (day - ctx.first_day) as usize;
-            let camp = if hi > lo {
-                let mut bi = hi - 1;
-                let t = clicks[bi].key >> 32;
-                let mut x = bi;
-                while x > lo && (clicks[x - 1].key >> 32) == t {
-                    x -= 1;
-                    if deref(clicks[x].kref) < deref(clicks[bi].kref) {
-                        bi = x;
-                    }
-                }
-                (clicks[bi].key as u32) as usize
-            } else {
+            let camp = if nc == 0 {
                 organic
+            } else {
+                // slide the 7-day click window [start - 7d, start]
+                while hi < nc && ((clicks.get_unchecked(hi).key >> 32) as u32) <= start {
+                    let c = clicks.get_unchecked(hi).key as u32 as usize;
+                    let x = *w.wcnt.get_unchecked(c);
+                    if x == 0 {
+                        *w.wpos.get_unchecked_mut(c) = w.active.len() as u32;
+                        w.active.push(c as u32);
+                    }
+                    *w.wcnt.get_unchecked_mut(c) = x + 1;
+                    hi += 1;
+                }
+                let low = start - WEEK as u32;
+                while lo < hi && ((clicks.get_unchecked(lo).key >> 32) as u32) < low {
+                    let c = clicks.get_unchecked(lo).key as u32 as usize;
+                    let x = *w.wcnt.get_unchecked(c) - 1;
+                    *w.wcnt.get_unchecked_mut(c) = x;
+                    if x == 0 {
+                        let pos = *w.wpos.get_unchecked(c) as usize;
+                        let last = w.active.pop().unwrap_unchecked();
+                        if last as usize != c {
+                            *w.active.get_unchecked_mut(pos) = last;
+                            *w.wpos.get_unchecked_mut(last as usize) = pos as u32;
+                        }
+                    }
+                    lo += 1;
+                }
+                for &c in w.active.iter() {
+                    *w.assisted.get_unchecked_mut(c as usize * ndays + dayidx) += 1;
+                }
+                if hi > lo {
+                    let mut bi = hi - 1;
+                    let t = clicks.get_unchecked(bi).key >> 32;
+                    let mut x = bi;
+                    while x > lo && (clicks.get_unchecked(x - 1).key >> 32) == t {
+                        x -= 1;
+                        if deref(clicks.get_unchecked(x).kref) < deref(clicks.get_unchecked(bi).kref) {
+                            bi = x;
+                        }
+                    }
+                    (clicks.get_unchecked(bi).key as u32) as usize
+                } else {
+                    organic
+                }
             };
-            let cc = w.camp_counts.get_unchecked_mut(camp * ndays + dayidx);
+            let cc = w.credited.get_unchecked_mut(camp * ndays + dayidx);
             cc[0] += 1;
             if rev > 0 {
                 cc[1] += 1;
                 cc[2] += rev;
             }
-            if hi > lo {
-                w.sid = w.sid.wrapping_add(1);
-                if w.sid == 0 {
-                    w.stamp.iter_mut().for_each(|s| *s = 0);
-                    w.sid = 1;
-                }
-                let sid = w.sid;
-                for c in &clicks[lo..hi] {
-                    let cp = (c.key as u32) as usize;
-                    if *w.stamp.get_unchecked(cp) != sid {
-                        *w.stamp.get_unchecked_mut(cp) = sid;
-                        w.camp_counts.get_unchecked_mut(cp * ndays + dayidx)[3] += 1;
-                    }
-                }
-            }
             k = m;
         }
+        for &c in w.active.iter() {
+            *w.wcnt.get_unchecked_mut(c as usize) = 0;
+        }
+        w.active.clear();
         flush_day(ud, name, cur_day, d_sessions, d_events, d_rev, d_purch, &mut w.cat_sum, cat_names);
     }
+    TM[2].fetch_add(tq.elapsed().as_nanos() as u64, Relaxed);
 }
 
 #[inline]
@@ -1441,6 +1572,7 @@ fn env_or(k: &str, d: &str) -> String {
 
 fn main() {
     let t0 = Instant::now();
+    init_month_tables();
     let verbose = std::env::var("SS_VERBOSE").is_ok();
     let lap = |what: &str| {
         if verbose {
@@ -1708,9 +1840,12 @@ fn main() {
                 handles.push(s.spawn(move || {
                     let mut w = PersonWork {
                         cat_sum: vec![0; ctx.ncat],
-                        stamp: vec![0; ctx.ncamp + 1],
-                        sid: 0,
-                        camp_counts: vec![[0; 4]; (ctx.ncamp + 1) * ctx.ndays],
+                        wcnt: vec![0; ctx.ncamp + 1],
+                        wpos: vec![0; ctx.ncamp + 1],
+                        active: Vec::with_capacity(ctx.ncamp + 1),
+                        plist: Vec::new(),
+                        credited: vec![[0; 3]; (ctx.ncamp + 1) * ctx.ndays],
+                        assisted: vec![0; (ctx.ncamp + 1) * ctx.ndays],
                         cnt: Vec::new(),
                         ccnt: Vec::new(),
                         ev: Vec::new(),
@@ -1726,7 +1861,8 @@ fn main() {
                             process_person_bucket(ctx, cat_names, outs, losers, order[j], &mut w, &mut ud);
                         }
                     }
-                    (ud, w.camp_counts)
+                    let cc: Vec<[i64; 4]> = w.credited.iter().zip(w.assisted.iter()).map(|(c, &a)| [c[0], c[1], c[2], a as i64]).collect();
+                    (ud, cc)
                 }));
             }
             for h in handles {
@@ -1734,6 +1870,7 @@ fn main() {
             }
         });
         lap("sessions");
+        if verbose { eprintln!("  person: events {:.1} clicks {:.1} walk {:.1} (thread-ms)", TM[0].load(Relaxed) as f64/1e6, TM[1].load(Relaxed) as f64/1e6, TM[2].load(Relaxed) as f64/1e6); }
 
         // ---- phase 4: write outputs
         let ud_dir = out_dir.join("user_daily");
