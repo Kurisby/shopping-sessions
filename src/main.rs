@@ -1565,6 +1565,9 @@ struct Buckets<T: Copy + 'static> {
     next: *mut T,             // arena bump pointer
     left: usize,              // chunks left in the arena
     arena: usize,             // chunks per arena region
+    all: Vec<*mut T>,         // every chunk start, in allocation order (a ref's chunk number)
+    rend: Vec<u32>,           // ref one past the bucket's current chunk
+    tag: u32,                 // high bits of every ref (the thread)
 }
 unsafe impl<T: Copy + 'static> Send for Buckets<T> {}
 unsafe impl<T: Copy + 'static> Sync for Buckets<T> {}
@@ -1581,7 +1584,31 @@ impl<T: Copy + 'static> Buckets<T> {
             next: mem.as_mut_ptr(),
             left: arena,
             arena,
+            all: Vec::new(),
+            rend: vec![0; n],
+            tag: 0,
         }
+    }
+    /// `push`, returning the record's ref: tag | chunk number << 10 | slot (chunks of 1024).
+    #[inline(always)]
+    fn push_ref(&mut self, b: usize, v: T) -> u32 {
+        unsafe {
+            let c = self.cur.get_unchecked_mut(b);
+            let p = c[0];
+            if p < c[1] {
+                *p = v;
+                c[0] = p.add(1);
+                *self.rend.get_unchecked(b) - c[1].offset_from(p) as u32
+            } else {
+                self.refill(b, v);
+                *self.rend.get_unchecked(b) - self.ch as u32
+            }
+        }
+    }
+    /// The record of a ref from `push_ref` (without its tag).
+    #[inline(always)]
+    unsafe fn at(&self, r: u32) -> *mut T {
+        self.all.get_unchecked((r >> 10) as usize).add((r & 1023) as usize)
     }
     #[inline(always)]
     fn push(&mut self, b: usize, v: T) {
@@ -1610,6 +1637,11 @@ impl<T: Copy + 'static> Buckets<T> {
             self.chunks[b].push(s);
             *s = v;
             self.cur[b] = [s.add(1), s.add(self.ch)];
+            if self.ch == 1024 {
+                assert!(self.all.len() < (1 << 17) - 1, "too many chunks");
+                self.rend[b] = self.tag | ((self.all.len() as u32) << 10) + 1024;
+            }
+            self.all.push(s);
         }
     }
     /// The bucket's records, chunk by chunk.
@@ -1640,16 +1672,15 @@ impl<T: Copy + 'static> Buckets<T> {
 struct DKey {
     ehash: u64,
     ingest: i32,
-    rowid: u32,
+    pref: u32, // the event's PRec (thread << 27 | ref), NONE when it has none
 }
 
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct PRec {
-    pid: u32,
+    pid: u32, // INVALID once dedup finds a copy that wins
     ts: u32,
     pc: u32, // price << 8 | category (price 0 = not a purchase)
-    rowid: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -1687,6 +1718,7 @@ const NEB: usize = 1 << EB_BITS;
 const NPB: usize = 512;
 const BATCH: usize = 64;
 const INVALID: u32 = u32::MAX;
+const NONE: u32 = u32::MAX;
 
 #[inline(always)]
 fn ebucket(h: u64) -> usize {
@@ -1736,16 +1768,16 @@ struct Pending {
     uref: u64,
     tsp: u64, // the ts field
     ingest: i64,
+    ehash: u64,
+    irel: i32, // ingest for dedup
     tsn: u32,
     pc: u32,
-    rowid: u32,
 }
 
 struct ThreadOut {
     dk: Buckets<DKey>,
     pe: Buckets<PRec>,
     pc: Buckets<CRec>,
-    rows: u32,
     tid: u32,
     pq: [[Pending; BATCH]; 4], // by ts form
     pn: [usize; 4],
@@ -1763,14 +1795,14 @@ impl ThreadOut {
         for i in 0..n {
             let e = unsafe { *self.pq[F].get_unchecked(i) };
             let ts = unsafe { parse_ts_form::<F>(e.tsp as *const u8, e.tsn as usize) };
-            if ts < ctx.ws || ts >= ctx.we {
-                continue;
-            }
-            if e.ingest == BAD_TS || e.ingest - ts > DAY {
-                continue;
-            }
-            let pid = ctx.ids.person(e.uhash, e.uref);
-            self.pe.push((pid >> ctx.pshift) as usize, PRec { pid, ts: (ts - ctx.base) as u32, pc: e.pc, rowid: e.rowid });
+            // (ingest is never BAD_TS here)
+            let pref = if (ts < ctx.ws) | (ts >= ctx.we) | (e.ingest.wrapping_sub(ts) > DAY) {
+                NONE
+            } else {
+                let pid = ctx.ids.person(e.uhash, e.uref);
+                self.pe.push_ref((pid >> ctx.pshift) as usize, PRec { pid, ts: (ts - ctx.base) as u32, pc: e.pc })
+            };
+            self.dk.push(ebucket(e.ehash), DKey { ehash: e.ehash, ingest: e.irel, pref });
         }
     }
     /// Queues a row (its person's ID slot prefetched); every 64 rows all queues are
@@ -1886,23 +1918,26 @@ unsafe fn parse_events(ctx: &Ctx, chunk: &'static [u8], out: &mut ThreadOut) {
             let ingest = parse_ts_fast(fp[3], fl[3]);
             (ingest, if ingest == BAD_TS { i32::MAX } else { ((ingest - base).div_euclid(1000)).clamp(i32::MIN as i64, (i32::MAX - 1) as i64) as i32 })
         };
-        let rowid = (out.tid << 27) | out.rows;
-        out.rows += 1;
-        out.dk.push(ebucket(ehash), DKey { ehash, ingest: ingest_rel, rowid });
-        // validation
+        // a row that fails validation still takes part in dedup
+        let nope = DKey { ehash, ingest: ingest_rel, pref: NONE };
         if fl[1] == 0 || fl[5] == 0 {
+            out.dk.push(ebucket(ehash), nope);
             return;
         }
         let mut pc = 0u32;
         if fl[4] == 4 {
             let w = std::ptr::read_unaligned(fp[4] as *const u32);
             if !((w == u32::from_le_bytes(*b"view")) | (w == u32::from_le_bytes(*b"cart"))) {
+                out.dk.push(ebucket(ehash), nope);
                 return;
             }
         } else if fl[4] == 8 && std::ptr::read_unaligned(fp[4] as *const u64) == u64::from_le_bytes(*b"purchase") {
             let price = match parse_price(sl(fp[6], fl[6])) {
                 Some(p) => p,
-                None => return,
+                None => {
+                    out.dk.push(ebucket(ehash), nope);
+                    return;
+                }
             };
             let cat = match ctx.products.get(sl(fp[5], fl[5])) {
                 ABSENT => ctx.unknown_cat,
@@ -1910,14 +1945,16 @@ unsafe fn parse_events(ctx: &Ctx, chunk: &'static [u8], out: &mut ThreadOut) {
             };
             pc = (price << 8) | cat;
         } else {
+            out.dk.push(ebucket(ehash), nope);
             return;
         }
         if ingest == BAD_TS {
+            out.dk.push(ebucket(ehash), nope);
             return;
         }
         // ts (window and ingest-delay checks too) is parsed with its queue, by form
         let uhash = hash_ptr(fp[1], fl[1]);
-        out.push_pending(Pending { uhash, uref: mkref(fp[1], fl[1]), tsp: fp[2] as u64, ingest, tsn: fl[2] as u32, pc, rowid }, ctx);
+        out.push_pending(Pending { uhash, uref: mkref(fp[1], fl[1]), tsp: fp[2] as u64, ingest, ehash, irel: ingest_rel, tsn: fl[2] as u32, pc }, ctx);
     });
     out.flat = flat;
     out.flush_all_events(ctx);
@@ -2196,34 +2233,21 @@ fn radix_hi32<T: Copy>(v: &mut [T], tmp: &mut Vec<T>, key: impl Fn(&T) -> u64) {
 }
 
 static TM: [AtomicU64; 4] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[ThreadOut], losers: &[&'static [AtomicU64]], b: usize, w: &mut PersonWork, ud: &mut UserDaily) {
+unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[ThreadOut], b: usize, w: &mut PersonWork, ud: &mut UserDaily) {
     let tq = Instant::now();
     let range = 1usize << ctx.pshift;
     let lo_pid = (b << ctx.pshift) as u32;
     w.cnt.clear();
     w.cnt.resize(range + 1, 0);
-    // count (and drop dedup losers in place)
+    // count per person; dedup losers (pid INVALID) go to the extra slot `range`, after
+    // everyone, so neither pass branches on them
+    let r32 = range as u32;
     let mut total = 0usize;
     for o in outs {
-        // all of a thread's records carry its id; their row numbers rise, ~npb rows apart,
-        // so each check reads a different bitmap line: prefetch them well ahead
-        let lw = losers.get_unchecked(o.tid as usize).as_ptr();
         for part in o.pe.parts(b) {
-            let n = part.len();
-            let pp = part.as_mut_ptr();
-            for j in 0..n {
-                if j + LPD < n {
-                    let i2 = ((*pp.add(j + LPD)).rowid & ((1 << 27) - 1)) as usize;
-                    _mm_prefetch(lw.add(i2 >> 6) as *const i8, _MM_HINT_T0);
-                }
-                let r = &mut *pp.add(j);
-                let i = (r.rowid & ((1 << 27) - 1)) as usize;
-                if (*lw.add(i >> 6)).load(Relaxed) & (1u64 << (i & 63)) != 0 {
-                    r.pid = INVALID;
-                } else {
-                    *w.cnt.get_unchecked_mut((r.pid - lo_pid) as usize) += 1;
-                    total += 1;
-                }
+            total += part.len();
+            for r in part.iter() {
+                *w.cnt.get_unchecked_mut(r.pid.wrapping_sub(lo_pid).min(r32) as usize) += 1;
             }
         }
     }
@@ -2243,12 +2267,10 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
     for o in outs {
         for part in o.pe.parts(b) {
             for r in part.iter() {
-                if r.pid != INVALID {
-                    let p = (r.pid - lo_pid) as usize;
-                    let at = *w.cnt.get_unchecked(p);
-                    *w.cnt.get_unchecked_mut(p) = at + 1;
-                    *w.ev.get_unchecked_mut(at as usize) = ((r.ts as u64) << 32) | r.pc as u64;
-                }
+                let p = r.pid.wrapping_sub(lo_pid).min(r32) as usize;
+                let at = *w.cnt.get_unchecked(p);
+                *w.cnt.get_unchecked_mut(p) = at + 1;
+                *w.ev.get_unchecked_mut(at as usize) = ((r.ts as u64) << 32) | r.pc as u64;
             }
         }
     }
@@ -2666,11 +2688,12 @@ fn main() {
                 let jobs = &jobs;
                 let next = &next;
                 handles.push(s.spawn(move || {
+                    let mut pe = Buckets::new(npb, 1024, per_t);
+                    pe.tag = (t as u32) << 27;
                     let mut out = ThreadOut {
                         dk: Buckets::new(NEB, 256, per_t),
-                        pe: Buckets::new(npb, 1024, per_t),
+                        pe,
                         pc: Buckets::new(npb, 256, per_tc),
-                        rows: 0,
                         tid: t as u32,
                         pq: [[Pending::default(); BATCH]; 4],
                         pn: [0; 4],
@@ -2704,10 +2727,10 @@ fn main() {
             let (mut u, mut u2, mut u3, mut c) = (0, 0, 0, 0);
             for o in outs.iter() {
                 for b in 0..o.dk.cur.len() { u += o.dk.len(b) * 16; c += o.dk.chunks[b].len() * o.dk.ch * 16; }
-                for b in 0..o.pe.cur.len() { u2 += o.pe.len(b) * 16; c += o.pe.chunks[b].len() * o.pe.ch * 16; }
+                for b in 0..o.pe.cur.len() { u2 += o.pe.len(b) * 12; c += o.pe.chunks[b].len() * o.pe.ch * 12; }
                 for b in 0..o.pc.cur.len() { u3 += o.pc.len(b) * 24; c += o.pc.chunks[b].len() * o.pc.ch * 24; }
             }
-            eprintln!("  mem dk {:.0} pe {:.0} pc {:.0} MB used, {:.0} MB in chunks, ids {:.0} MB, rows {:?}", mb(u), mb(u2), mb(u3), mb(c), mb(ctx.ids.mask as usize * 16), outs.iter().map(|o| o.rows).collect::<Vec<_>>());
+            eprintln!("  mem dk {:.0} pe {:.0} pc {:.0} MB used, {:.0} MB in chunks, ids {:.0} MB, rows {:?}", mb(u), mb(u2), mb(u3), mb(c), mb(ctx.ids.mask as usize * 16), outs.iter().map(|o| (0..NEB).map(|b| o.dk.len(b)).sum::<usize>()).collect::<Vec<_>>());
         }
         if ctx.ids.overflow.load(Relaxed) {
             if verbose {
@@ -2720,22 +2743,24 @@ fn main() {
             continue;
         }
 
-        // ---- phase 2: dedup event copies (smallest ingest_ts wins) -> loser bitmap
-        let losers: Vec<&'static [AtomicU64]> = outs.iter().map(|o| &*zeroed::<AtomicU64>((o.rows as usize + 63) / 64 + 1)).collect();
+        // ---- phase 2: dedup event copies (smallest ingest_ts wins); a losing copy's PRec gets pid INVALID
         {
             let next = AtomicUsize::new(0);
             std::thread::scope(|s| {
                 for _ in 0..nthreads {
                     let outs = &outs;
-                    let losers = &losers;
                     let next = &next;
                     s.spawn(move || {
-                        let mut tab: Vec<[u64; 2]> = Vec::new(); // (ehash, ingest << 32 | rowid)
+                        let mut tab: Vec<[u64; 2]> = Vec::new(); // (ehash, ingest << 32 | pref)
                         let mut used: Vec<u32> = Vec::new();
-                        let mark = |rowid: u32| {
-                            let t = (rowid >> 27) as usize;
-                            let i = (rowid & ((1 << 27) - 1)) as usize;
-                            losers[t][i >> 6].fetch_or(1u64 << (i & 63), Relaxed);
+                        // each PRec has one DKey, so no two threads write the same record
+                        let mark = |pref: u32| {
+                            if pref != NONE {
+                                unsafe {
+                                    let p = outs.get_unchecked((pref >> 27) as usize).pe.at(pref & ((1 << 27) - 1));
+                                    std::ptr::write_volatile(std::ptr::addr_of_mut!((*p).pid), INVALID);
+                                }
+                            }
                         };
                         loop {
                             let b = next.fetch_add(1, Relaxed);
@@ -2753,7 +2778,7 @@ fn main() {
                             for o in outs.iter() {
                                 for part in o.dk.parts(b) {
                                     for r in part.iter() {
-                                        let v = ((r.ingest as i64 - i32::MIN as i64) as u64) << 32 | r.rowid as u64;
+                                        let v = ((r.ingest as i64 - i32::MIN as i64) as u64) << 32 | r.pref as u64;
                                         let mut p = (r.ehash as usize) & mask;
                                         loop {
                                             let e = unsafe { tab.get_unchecked_mut(p) };
@@ -2801,7 +2826,6 @@ fn main() {
             for _t in 0..nthreads {
                 let next = &next;
                 let outs = &outs;
-                let losers = &losers;
                 let order = &order;
                 let ctx = &ctx;
                 let cat_names = &cat_names;
@@ -2830,7 +2854,7 @@ fn main() {
                         }
                         let tb = Instant::now();
                         unsafe {
-                            process_person_bucket(ctx, cat_names, outs, losers, order[j], &mut w, &mut ud);
+                            process_person_bucket(ctx, cat_names, outs, order[j], &mut w, &mut ud);
                         }
                         let dt = tb.elapsed().as_micros() as u64;
                         if dt > BMAX.load(Relaxed) {
