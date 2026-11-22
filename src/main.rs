@@ -27,6 +27,45 @@ const MAP_PRIVATE: i32 = 2;
 const MAP_FIXED: i32 = 0x10;
 const MAP_ANON: i32 = 0x20;
 const MADV_HUGEPAGE: i32 = 14;
+const MADV_DONTNEED: i32 = 4;
+
+/// Big mappings (start, len), released in parallel before exit so the kernel's
+/// single-threaded teardown has little left to do.
+static REGIONS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+static NO_THP: AtomicBool = AtomicBool::new(false);
+
+fn note_region(p: *mut u8, len: usize) {
+    REGIONS.lock().unwrap().push((p as usize, len));
+}
+
+fn release_regions(nthreads: usize) {
+    const PIECE: usize = 32 << 20;
+    let regs = std::mem::take(&mut *REGIONS.lock().unwrap());
+    let mut pieces: Vec<(usize, usize)> = Vec::new();
+    for (p, len) in regs {
+        let len = (len + 4095) & !4095;
+        let mut o = 0;
+        while o < len {
+            let n = PIECE.min(len - o);
+            pieces.push((p + o, n));
+            o += n;
+        }
+    }
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..nthreads {
+            s.spawn(|| loop {
+                let j = next.fetch_add(1, Relaxed);
+                if j >= pieces.len() {
+                    break;
+                }
+                unsafe {
+                    madvise(pieces[j].0 as *mut u8, pieces[j].1, MADV_DONTNEED);
+                }
+            });
+        }
+    });
+}
 
 /// Maps a file read-only with at least one zero page after it, so SIMD loads may run past the end.
 fn map_file(path: &Path) -> &'static [u8] {
@@ -45,6 +84,7 @@ fn map_file(path: &Path) -> &'static [u8] {
         if p as isize == -1 || p != base {
             panic!("mmap failed for {}", path.display());
         }
+        note_region(p, len);
         std::slice::from_raw_parts(p, len)
     }
 }
@@ -58,7 +98,10 @@ fn zeroed<T>(n: usize) -> &'static mut [T] {
         if p as isize == -1 {
             panic!("mmap anon failed");
         }
-        madvise(p, total, MADV_HUGEPAGE);
+        if !NO_THP.load(Relaxed) {
+            madvise(p, total, MADV_HUGEPAGE);
+        }
+        note_region(p, total);
         std::slice::from_raw_parts_mut(p as *mut T, n)
     }
 }
@@ -397,6 +440,8 @@ fn parse_price(v: &[u8]) -> Option<u32> {
 
 static mut MONTH_START: [i32; 4800] = [0; 4800]; // days since epoch of the 1st, years 1900..2300
 static mut MONTH_LEN: [u8; 4800] = [0; 4800];
+/// (year - 1900) * 16 + month -> days-since-epoch of the 1st << 8 | month length
+static mut TBL16: [i32; 6400] = [0; 6400];
 
 fn init_month_tables() {
     unsafe {
@@ -415,6 +460,7 @@ fn init_month_tables() {
                     4 | 6 | 9 | 11 => 30,
                     _ => 31,
                 };
+                TBL16[((y - 1900) * 16 + m) as usize] = (MONTH_START[i] << 8) | MONTH_LEN[i] as i32;
             }
         }
     }
@@ -436,9 +482,10 @@ fn parse8(x: u64) -> u64 {
 
 const BAD_TS: i64 = i64::MIN;
 
-/// `YYYY-MM-DDTHH:MM:SSZ` (n == 20). Returns BAD_TS when not valid F1.
+/// `YYYY-MM-DDTHH:MM:SSZ` (F1, n == 20) or `YYYY-MM-DDTHH:MM:SS+HH:MM` (F2, n == 25).
+/// Returns BAD_TS when not valid. F2 reads 3 bytes past its end (padded memory only).
 #[inline(always)]
-unsafe fn parse_f1(p: *const u8) -> i64 {
+unsafe fn parse_f12<const F2: bool>(p: *const u8) -> i64 {
     const S0: u64 = 0xFF0000FF00000000;
     const E0: u64 = 0x2D00002D00000000;
     const S1: u64 = 0x0000FF0000FF0000;
@@ -452,7 +499,8 @@ unsafe fn parse_f1(p: *const u8) -> i64 {
     let x0 = (w0 & !S0) | (Z & S0);
     let x1 = (w1 & !S1) | (Z & S1);
     let x2 = (w2 & !S2) | (Z & S2) | 0x3030303000000000;
-    let ok = ((w0 & S0) == E0) & ((w1 & S1) == E1) & ((w2 & S2) == E2) & all_digits(x0) & all_digits(x1) & all_digits(x2);
+    let tail = if F2 { (w2 & 0xFF) == 0x3A } else { (w2 & S2) == E2 };
+    let ok = ((w0 & S0) == E0) & ((w1 & S1) == E1) & tail & all_digits(x0) & all_digits(x1) & all_digits(x2);
     if !ok {
         return BAD_TS;
     }
@@ -470,7 +518,7 @@ unsafe fn parse_f1(p: *const u8) -> i64 {
     let second = (t2 >> 8) & 0xFF;
     if year < 1900 || year >= 2300 || month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59 {
         if year < 1900 || year >= 2300 {
-            return parse_iso(sl(p, 20)).unwrap_or(BAD_TS);
+            return parse_iso(sl(p, if F2 { 25 } else { 20 })).unwrap_or(BAD_TS);
         }
         return BAD_TS;
     }
@@ -478,14 +526,107 @@ unsafe fn parse_f1(p: *const u8) -> i64 {
     if day < 1 || day > MONTH_LEN[idx] as u64 {
         return BAD_TS;
     }
-    ((MONTH_START[idx] as i64 + day as i64 - 1) * 86_400 + (hour * 3600 + minute * 60 + second) as i64) * 1000
+    let ms = ((MONTH_START[idx] as i64 + day as i64 - 1) * 86_400 + (hour * 3600 + minute * 60 + second) as i64) * 1000;
+    if !F2 {
+        return ms;
+    }
+    // offset: sign at 19, "HH:MM" at 20..25
+    let sign = *p.add(19);
+    let w3 = std::ptr::read_unaligned(p.add(20) as *const u64) & 0xFF_FFFF_FFFF;
+    let x3 = (w3 & !0xFF_0000) | 0x30_0000 | 0x3030_3000_0000_0000;
+    if (sign != b'+' && sign != b'-') | ((w3 >> 16) & 0xFF != b':' as u64) | !all_digits(x3) {
+        return BAD_TS;
+    }
+    let oh = ((w3 & 0xFF) - 0x30) * 10 + ((w3 >> 8) & 0xFF) - 0x30;
+    let om = (((w3 >> 24) & 0xFF) - 0x30) * 10 + ((w3 >> 32) & 0xFF) - 0x30;
+    if oh > 23 || om > 59 {
+        return BAD_TS;
+    }
+    let off = ((oh * 60 + om) * 60_000) as i64;
+    if sign == b'+' {
+        ms - off
+    } else {
+        ms + off
+    }
+}
+
+const fn v128(b: [u8; 16]) -> __m128i {
+    unsafe { std::mem::transmute(b) }
+}
+const fn w128(w: [i16; 8]) -> __m128i {
+    unsafe { std::mem::transmute(w) }
+}
+
+/// SIMD form of `parse_f12`: same results. F2 reads 3 bytes past its end (padded memory only).
+#[inline(always)]
+unsafe fn parse_f12_simd<const F2: bool>(p: *const u8) -> i64 {
+    const PA: __m128i = v128(*b"0000-00-00T00:00");
+    const LA: __m128i = v128([9, 9, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9]);
+    const PB1: __m128i = v128(*b"-00-00T00:00:00Z");
+    const LB1: __m128i = v128([0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0]);
+    const PB2: __m128i = v128(*b"-00-00T00:00:00\0");
+    const LB2: __m128i = v128([0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 255]);
+    const SHA: __m128i = v128([0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 0x80, 0x80, 0x80, 0x80]);
+    const SHB: __m128i = v128([0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 13, 14, 0x80, 0x80]);
+    const W10: __m128i = v128([10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1]);
+    const LO: __m128i = w128([19, 0, 1, 1, 0, 0, 0, 0]);
+    const HI: __m128i = w128([22, 99, 12, 31, 23, 59, 59, 0]);
+    const WM: __m128i = w128([1600, 16, 1, 0, 3600, 60, 1, 0]);
+    let a = _mm_loadu_si128(p as *const __m128i);
+    let b = _mm_loadu_si128(p.add(4) as *const __m128i);
+    let xa = _mm_xor_si128(a, PA);
+    let xb = _mm_xor_si128(b, if F2 { PB2 } else { PB1 });
+    let lb = if F2 { LB2 } else { LB1 };
+    let ok = _mm_and_si128(_mm_cmpeq_epi8(_mm_max_epu8(xa, LA), LA), _mm_cmpeq_epi8(_mm_max_epu8(xb, lb), lb));
+    if _mm_movemask_epi8(ok) != 0xFFFF {
+        return BAD_TS;
+    }
+    let v = _mm_or_si128(_mm_shuffle_epi8(xa, SHA), _mm_shuffle_epi8(xb, SHB));
+    let vals = _mm_maddubs_epi16(v, W10); // [YY, YY, MM, DD, hh, mm, ss, 0]
+    let bad = _mm_or_si128(_mm_cmpgt_epi16(LO, vals), _mm_cmpgt_epi16(vals, HI));
+    if _mm_movemask_epi8(bad) != 0 {
+        // out-of-table year (exact slow path) or a bad field
+        return parse_iso(sl(p, if F2 { 25 } else { 20 })).unwrap_or(BAD_TS);
+    }
+    let r = _mm_madd_epi16(vals, WM); // [ym16, month, hh*3600 + mm*60, ss]
+    let ym = _mm_cvtsi128_si32(r) + _mm_extract_epi32::<1>(r) - 1900 * 16;
+    let hms = _mm_extract_epi32::<2>(r) + _mm_extract_epi32::<3>(r);
+    let d = _mm_extract_epi16::<3>(vals);
+    let packed = *TBL16.get_unchecked(ym as usize);
+    if (d - 1) as u32 >= (packed & 0xFF) as u32 {
+        return BAD_TS;
+    }
+    let ms = (((packed >> 8) + d - 1) as i64 * 86_400 + hms as i64) * 1000;
+    if !F2 {
+        return ms;
+    }
+    let sign = *p.add(19);
+    let w3 = std::ptr::read_unaligned(p.add(20) as *const u64) & 0xFF_FFFF_FFFF;
+    let x3 = (w3 & !0xFF_0000) | 0x30_0000 | 0x3030_3000_0000_0000;
+    if (sign != b'+' && sign != b'-') | ((w3 >> 16) & 0xFF != b':' as u64) | !all_digits(x3) {
+        return BAD_TS;
+    }
+    let oh = ((w3 & 0xFF) - 0x30) * 10 + ((w3 >> 8) & 0xFF) - 0x30;
+    let om = (((w3 >> 24) & 0xFF) - 0x30) * 10 + ((w3 >> 32) & 0xFF) - 0x30;
+    if oh > 23 || om > 59 {
+        return BAD_TS;
+    }
+    let off = ((oh * 60 + om) * 60_000) as i64;
+    if sign == b'+' {
+        ms - off
+    } else {
+        ms + off
+    }
 }
 
 /// Any timestamp form; BAD_TS when bad.
 #[inline(always)]
 unsafe fn parse_ts_fast(p: *const u8, n: usize) -> i64 {
     if n == 20 {
-        return parse_f1(p);
+        return parse_f12_simd::<false>(p);
+    }
+    if n == 25 {
+        return parse_f12_simd::<true>(p);
     }
     if n == 13 {
         let a = std::ptr::read_unaligned(p as *const u64);
@@ -568,6 +709,25 @@ unsafe fn block_masks(p: *const u8) -> (u64, u64) {
 }
 
 
+/// (',' or '\n' mask, '"' mask, '\n' mask) of 64 bytes.
+#[inline(always)]
+unsafe fn block_masks3(p: *const u8) -> (u64, u64, u64) {
+    let a = _mm256_loadu_si256(p as *const __m256i);
+    let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
+    let comma = _mm256_set1_epi8(b',' as i8);
+    let nl = _mm256_set1_epi8(b'\n' as i8);
+    let qt = _mm256_set1_epi8(b'"' as i8);
+    let na = _mm256_cmpeq_epi8(a, nl);
+    let nb = _mm256_cmpeq_epi8(b, nl);
+    let sa = _mm256_or_si256(_mm256_cmpeq_epi8(a, comma), na);
+    let sb = _mm256_or_si256(_mm256_cmpeq_epi8(b, comma), nb);
+    let s = (_mm256_movemask_epi8(sa) as u32 as u64) | ((_mm256_movemask_epi8(sb) as u32 as u64) << 32);
+    let n = (_mm256_movemask_epi8(na) as u32 as u64) | ((_mm256_movemask_epi8(nb) as u32 as u64) << 32);
+    let q = (_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, qt)) as u32 as u64)
+        | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, qt)) as u32 as u64) << 32);
+    (s, q, n)
+}
+
 // ---------------------------------------------------------------- region-indexed line splitter
 // Each region (<= ~64 KB, whole lines) first gets a flat index of every ',' / '\n' offset
 // (branch-light, 8 per block unconditionally), plus per-block quote counts. Lines then take
@@ -576,38 +736,42 @@ unsafe fn block_masks(p: *const u8) -> (u64, u64) {
 const REGION: usize = 1 << 16;
 
 struct Flat {
-    idx: Vec<u32>,
+    idx: Vec<u32>, // every ',' / '\n' offset, then 16 copies of len
+    nl: Vec<u32>,  // every '\n' offset, then 4 copies of len
     qcum: Vec<u32>,
     qm: Vec<u64>,
-    n: usize,
 }
 
 impl Flat {
     fn new() -> Self {
-        Flat { idx: Vec::new(), qcum: Vec::new(), qm: Vec::new(), n: 0 }
+        Flat { idx: Vec::new(), nl: Vec::new(), qcum: Vec::new(), qm: Vec::new() }
     }
     #[inline(always)]
     unsafe fn build(&mut self, start: *const u8, len: usize) {
         let nb = (len + 63) / 64;
         if self.idx.capacity() < len + 96 {
             self.idx = Vec::with_capacity(len + 96);
+            self.nl = Vec::with_capacity(len + 96);
         }
         if self.qcum.capacity() < nb + 2 {
             self.qcum = Vec::with_capacity(nb + 2);
             self.qm = Vec::with_capacity(nb + 2);
         }
         let ip = self.idx.as_mut_ptr();
+        let np = self.nl.as_mut_ptr();
         let qc = self.qcum.as_mut_ptr();
         let qmp = self.qm.as_mut_ptr();
         let mut n = 0usize;
+        let mut m = 0usize;
         let mut qsum = 0u32;
         for b in 0..nb {
-            let (mut s, mut q) = block_masks(start.add(b * 64));
+            let (mut s, mut q, mut nm) = block_masks3(start.add(b * 64));
             let rem = len - b * 64;
             if rem < 64 {
-                let m = (1u64 << rem) - 1;
-                s &= m;
-                q &= m;
+                let k = (1u64 << rem) - 1;
+                s &= k;
+                q &= k;
+                nm &= k;
             }
             *qc.add(b) = qsum;
             *qmp.add(b) = q;
@@ -634,13 +798,30 @@ impl Flat {
                 }
             }
             n += cnt;
+            let cn = nm.count_ones() as usize;
+            let o = np.add(m);
+            *o = base + nm.trailing_zeros();
+            nm &= nm.wrapping_sub(1);
+            *o.add(1) = base + nm.trailing_zeros();
+            if cn > 2 {
+                nm &= nm.wrapping_sub(1);
+                let mut k = 2;
+                while nm != 0 {
+                    *o.add(k) = base + nm.trailing_zeros();
+                    nm &= nm.wrapping_sub(1);
+                    k += 1;
+                }
+            }
+            m += cn;
         }
         for k in 0..16 {
             *ip.add(n + k) = len as u32;
         }
+        for k in 0..4 {
+            *np.add(m + k) = len as u32;
+        }
         *qc.add(nb) = qsum;
         *qmp.add(nb) = 0;
-        self.n = n;
     }
     #[inline(always)]
     unsafe fn qbefore(&self, off: u32) -> u32 {
@@ -679,28 +860,29 @@ unsafe fn for_lines<const N: usize>(flat: &mut Flat, chunk: &'static [u8], mut f
         let len = (re - rs) as u32;
         flat.build(base, re - rs);
         let ix = flat.idx.as_ptr();
-        let mut j = 0usize;
+        let nx = flat.nl.as_ptr();
+        let mut j = 0usize; // index (in ix) of the line's first separator
+        let mut k = 0usize; // index (in nx) of the line's newline
         let mut ls = 0u32;
+        let mut qls = 0u32; // quotes before ls
         while ls < len {
             let s = ix.add(j);
-            let mut good = true;
-            for i in 0..N - 1 {
-                let o = *s.add(i);
-                good &= (o < len) & (*base.add(o as usize) == b',');
-            }
+            let e = *nx.add(k); // the line's end: its '\n', or len
+            k += 1;
             let last = *s.add(N - 1);
-            good &= (last >= len) | (*base.add(last.min(len) as usize) == b'\n');
-            if !good {
-                let mut k = j;
-                loop {
-                    let o = *ix.add(k);
-                    if o >= len || *base.add(o as usize) == b'\n' {
-                        break;
-                    }
-                    k += 1;
+            // well-formed: the N-th separator is the line's first newline (or the end),
+            // so the N-1 before it are commas
+            if (last != e) | (*s.add(N - 2) >= last) {
+                if e >= len {
+                    break;
                 }
-                ls = (*ix.add(k)).min(len - 1) + 1;
-                j = k + 1;
+                let mut jj = j;
+                while *ix.add(jj) != e {
+                    jj += 1;
+                }
+                j = jj + 1;
+                ls = e + 1;
+                qls = flat.qbefore(ls);
                 continue;
             }
             fp[0] = base.add(ls as usize);
@@ -710,23 +892,25 @@ unsafe fn for_lines<const N: usize>(flat: &mut Flat, chunk: &'static [u8], mut f
                 fp[i] = base.add(a as usize);
                 fl[i] = (*s.add(i) - a) as usize;
             }
-            let q = flat.qbefore(last) - flat.qbefore(ls);
+            // the line's '\n' is no quote, so quotes before the next line = quotes before `last`
+            let ql = flat.qbefore(last);
+            let q = ql - qls;
+            qls = ql;
             ls = last + 1;
             j += N;
             if q != 0 {
+                // fields wrapped in a quote pair lose it; the line is well-formed only
+                // if those pairs are all its quotes
                 let mut fq = 0u32;
-                let mut okq = true;
                 for i in 0..N {
                     let p = fp[i];
                     let n = fl[i];
-                    let first_q = (n > 0) & (*p == b'"');
-                    let last_q = (n >= 2) & (*p.add(n.saturating_sub(1)) == b'"');
-                    okq &= !first_q | last_q;
-                    fq += first_q as u32;
-                    fp[i] = p.add(first_q as usize);
-                    fl[i] = n.wrapping_sub(2 * first_q as usize);
+                    let both = (n >= 2) & (*p == b'"') & (*p.add(n.max(1) - 1) == b'"');
+                    fq += both as u32;
+                    fp[i] = p.add(both as usize);
+                    fl[i] = n - 2 * both as usize;
                 }
-                if !okq || q != 2 * fq {
+                if q != 2 * fq {
                     continue;
                 }
             }
@@ -807,7 +991,7 @@ impl Lookup {
     }
 }
 
-fn read_small_csv(path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn read_small_csv(path: &Path) -> Vec<(&'static [u8], &'static [u8])> {
     let data = read_padded(path);
     let mut rows = Vec::new();
     let first = memchr_nl(data, 0);
@@ -817,7 +1001,7 @@ fn read_small_csv(path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
     for_each_line(&data[first + 1..], |line| {
         let mut f: [&'static [u8]; 2] = [&[]; 2];
         if split_line(line, &mut f) && !f[0].is_empty() {
-            rows.push((f[0].to_vec(), f[1].to_vec()));
+            rows.push((f[0], f[1]));
         }
     });
     rows
@@ -1072,7 +1256,7 @@ fn build_links(ids: &Ids, link_chunks: &[&'static [u8]], nthreads: usize) {
 struct Buckets<T: Copy + 'static> {
     base: *mut T,
     cap: usize,
-    lens: Vec<u32>,
+    cur: Vec<[*mut T; 2]>, // write pointer, end of the bucket's region
     spill: Vec<Vec<T>>,
 }
 unsafe impl<T: Copy + 'static> Send for Buckets<T> {}
@@ -1081,15 +1265,18 @@ unsafe impl<T: Copy + 'static> Sync for Buckets<T> {}
 impl<T: Copy + 'static> Buckets<T> {
     fn new(n: usize, cap: usize) -> Self {
         let mem = zeroed::<T>(n * cap);
-        Buckets { base: mem.as_mut_ptr(), cap, lens: vec![0; n], spill: (0..n).map(|_| Vec::new()).collect() }
+        let base = mem.as_mut_ptr();
+        let cur = (0..n).map(|b| unsafe { [base.add(b * cap), base.add((b + 1) * cap)] }).collect();
+        Buckets { base, cap, cur, spill: (0..n).map(|_| Vec::new()).collect() }
     }
     #[inline(always)]
     fn push(&mut self, b: usize, v: T) {
         unsafe {
-            let l = *self.lens.get_unchecked(b) as usize;
-            if l < self.cap {
-                *self.base.add(b * self.cap + l) = v;
-                *self.lens.get_unchecked_mut(b) = (l + 1) as u32;
+            let c = self.cur.get_unchecked_mut(b);
+            let p = c[0];
+            if p < c[1] {
+                *p = v;
+                c[0] = p.add(1);
             } else {
                 self.spill.get_unchecked_mut(b).push(v);
             }
@@ -1097,7 +1284,10 @@ impl<T: Copy + 'static> Buckets<T> {
     }
     #[inline(always)]
     fn main(&self, b: usize) -> &mut [T] {
-        unsafe { std::slice::from_raw_parts_mut(self.base.add(b * self.cap), self.lens[b] as usize) }
+        unsafe {
+            let s = self.base.add(b * self.cap);
+            std::slice::from_raw_parts_mut(s, self.cur[b][0].offset_from(s) as usize)
+        }
     }
     #[inline(always)]
     fn spilled(&self, b: usize) -> &mut [T] {
@@ -1105,7 +1295,7 @@ impl<T: Copy + 'static> Buckets<T> {
         unsafe { std::slice::from_raw_parts_mut(v.as_ptr() as *mut T, v.len()) }
     }
     fn len(&self, b: usize) -> usize {
-        self.lens[b] as usize + self.spill[b].len()
+        self.main(b).len() + self.spill[b].len()
     }
 }
 
@@ -1666,6 +1856,9 @@ fn env_or(k: &str, d: &str) -> String {
 fn main() {
     let t0 = Instant::now();
     init_month_tables();
+    if std::env::var("SS_NOTHP").is_ok() {
+        NO_THP.store(true, Relaxed);
+    }
     let verbose = std::env::var("SS_VERBOSE").is_ok();
     let lap = |what: &str| {
         if verbose {
@@ -1704,15 +1897,27 @@ fn main() {
     let pc_dir = data_dir.clone();
     let mut pc_handle = Some(std::thread::spawn(move || {
         let prows = read_small_csv(&pc_dir.join("products.csv"));
-        let mut cat_names: Vec<Vec<u8>> = prows.iter().map(|r| r.1.clone()).collect();
-        cat_names.push(b"unknown".to_vec());
+        // categories in first-appearance order, then sorted
+        let mut cmap: std::collections::HashMap<&'static [u8], u32> = std::collections::HashMap::new();
+        let mut uniq: Vec<&'static [u8]> = Vec::new();
+        let mut pcat: Vec<u32> = Vec::with_capacity(prows.len());
+        for &(_, cat) in &prows {
+            let id = *cmap.entry(cat).or_insert_with(|| {
+                uniq.push(cat);
+                (uniq.len() - 1) as u32
+            });
+            pcat.push(id);
+        }
+        if !cmap.contains_key(&b"unknown"[..]) {
+            uniq.push(b"unknown");
+        }
+        let mut cat_names: Vec<Vec<u8>> = uniq.iter().map(|c| c.to_vec()).collect();
         cat_names.sort();
-        cat_names.dedup();
         assert!(cat_names.len() <= 255, "too many categories");
+        let remap: Vec<u32> = uniq.iter().map(|c| cat_names.binary_search_by(|x| x.as_slice().cmp(c)).unwrap() as u32).collect();
         let mut products = Lookup::new(b"p");
-        for (pid, cat) in &prows {
-            let c = cat_names.binary_search(cat).unwrap() as u32;
-            products.insert(pid, c);
+        for (i, &(pid, _)) in prows.iter().enumerate() {
+            products.insert(pid, remap[pcat[i] as usize]);
         }
         let unknown_cat = cat_names.binary_search(&b"unknown".to_vec()).unwrap() as u32;
         let crows = read_small_csv(&pc_dir.join("campaigns.csv"));
@@ -1725,7 +1930,7 @@ fn main() {
     let mut cat_names: Vec<Vec<u8>> = Vec::new();
     let mut products = Lookup::new(b"p");
     let mut unknown_cat = 0u32;
-    let mut crows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut crows: Vec<(&'static [u8], &'static [u8])> = Vec::new();
     let mut campaigns = Lookup::new(b"c_");
 
     // files (mapped in parallel)
@@ -2085,6 +2290,76 @@ fn main() {
             parquet::write(&mut bw, n, &cols).unwrap();
         });
         lap("written");
+        if std::env::var("SS_NOREL").is_err() {
+            release_regions(nthreads);
+            lap("released");
+        }
         std::process::exit(0);
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+    fn gen(r: &mut Rng, f2: bool) -> Vec<u8> {
+        let years = [1899, 1900, 1901, 1969, 1970, 2000, 2024, 2026, 2027, 2028, 2099, 2100, 2200, 2299, 2300, 2400, 0, 9999];
+        let y = if r.below(4) == 0 { r.below(10000) } else { years[r.below(years.len() as u64) as usize] };
+        let mo = if r.below(3) == 0 { r.below(100) } else { 1 + r.below(12) };
+        let d = if r.below(3) == 0 { r.below(100) } else { [1, 28, 29, 30, 31, 15][r.below(6) as usize] };
+        let h = if r.below(4) == 0 { r.below(100) } else { r.below(24) };
+        let mi = if r.below(4) == 0 { r.below(100) } else { r.below(60) };
+        let s = if r.below(4) == 0 { r.below(100) } else { r.below(60) };
+        let mut v = format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}").into_bytes();
+        if f2 {
+            let oh = if r.below(4) == 0 { r.below(100) } else { r.below(24) };
+            let om = if r.below(4) == 0 { r.below(100) } else { r.below(60) };
+            v.extend_from_slice(format!("{}{oh:02}:{om:02}", if r.below(2) == 0 { '+' } else { '-' }).as_bytes());
+        } else {
+            v.push(b'Z');
+        }
+        // mutations
+        let nm = r.below(4);
+        let alphabet = b"0123456789-:TZ+ /a\x00\xff9";
+        for _ in 0..nm {
+            if r.below(2) == 0 {
+                let i = r.below(v.len() as u64) as usize;
+                v[i] = alphabet[r.below(alphabet.len() as u64) as usize];
+            }
+        }
+        v
+    }
+    #[test]
+    fn fuzz_ts() {
+        init_month_tables();
+        let mut r = Rng(0x9E3779B97F4A7C15);
+        let mut buf = vec![0u8; 64];
+        let mut valid = 0u64;
+        for it in 0..20_000_000u64 {
+            let v = gen(&mut r, it & 1 == 1);
+            buf[..v.len()].copy_from_slice(&v);
+            for k in v.len()..64 {
+                buf[k] = (r.next() & 0xFF) as u8;
+            }
+            let want = parse_ts(&v).unwrap_or(BAD_TS);
+            let got = unsafe { parse_ts_fast(buf.as_ptr(), v.len()) };
+            let old = unsafe { if v.len() == 20 { parse_f12::<false>(buf.as_ptr()) } else { parse_f12::<true>(buf.as_ptr()) } };
+            assert_eq!(got, want, "input {:?}", String::from_utf8_lossy(&v));
+            assert_eq!(old, want, "old input {:?}", String::from_utf8_lossy(&v));
+            valid += (want != BAD_TS) as u64;
+        }
+        eprintln!("valid {valid}");
     }
 }
