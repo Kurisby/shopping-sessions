@@ -2128,14 +2128,26 @@ unsafe fn merge_sort_mid(v: &mut [u64], tmp: &mut Vec<u64>, small: &mut [u64; 33
             let mid = (start + width).min(n);
             let end = (start + 2 * width).min(n);
             let (mut i, mut j, mut k) = (start, mid, start);
-            while (i < mid) & (j < end) {
-                let a = *src.add(i);
-                let c = *src.add(j);
-                let tb = c < a;
-                *dst.add(k) = if tb { c } else { a };
-                j += tb as usize;
-                i += !tb as usize;
-                k += 1;
+            if mid < end {
+                // the heads stay in registers and both successors load every step (the
+                // index of the last one clamped), so a step waits on a compare and a move,
+                // not on the load its own compare picked
+                let mut a = *src.add(i);
+                let mut c = *src.add(j);
+                loop {
+                    let na = *src.add(i + 1); // i + 1 <= mid < end: in bounds
+                    let nc = *src.add((j + 1).min(end - 1));
+                    let tb = c < a;
+                    *dst.add(k) = if tb { c } else { a };
+                    k += 1;
+                    j += tb as usize;
+                    i += !tb as usize;
+                    if (i >= mid) | (j >= end) {
+                        break;
+                    }
+                    a = if tb { a } else { na };
+                    c = if tb { nc } else { c };
+                }
             }
             std::ptr::copy_nonoverlapping(src.add(i), dst.add(k), mid - i);
             k += mid - i;
