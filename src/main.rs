@@ -1267,6 +1267,12 @@ struct Name {
     w1: AtomicU64,
 }
 
+/// The first 7 bytes of `x` (little-endian bytes) as a big-endian 56-bit number.
+#[inline(always)]
+fn be7(x: u64) -> u64 {
+    (x << 8).swap_bytes()
+}
+
 impl Name {
     /// Stores the ID that `r` (a mkref of padded memory) points at.
     #[inline(always)]
@@ -1276,7 +1282,8 @@ impl Name {
         let (a, b) = unsafe {
             let rd = |i: usize| std::ptr::read_unaligned(p.add(i) as *const u64);
             if n > 15 {
-                (r, 0xFFu64 << 56)
+                // long: the ref, and the first 7 bytes (for comparisons without a dereference)
+                (r, (0xFFu64 << 56) | be7(rd(0)))
             } else if n > 8 {
                 (rd(0), (rd(n - 8) >> (8 * (16 - n))) | ((n as u64) << 56))
             } else if n == 8 {
@@ -1291,13 +1298,22 @@ impl Name {
         // w1 is never 0 once set (IDs are not empty), so it doubles as the "ready" flag
         self.w1.store(b, Release);
     }
-    /// `get` for a name another thread may still be storing (its slot key is already visible).
+    /// The name's first 7 bytes, zero-padded, big-endian: when two names' keys differ, they
+    /// order the names as their bytes do. Waits for a name another thread may still be storing
+    /// (its slot key is already visible).
     #[inline(always)]
-    fn get_sync(&'static self) -> &'static [u8] {
-        while self.w1.load(Acquire) == 0 {
+    fn key7_sync(&self) -> u64 {
+        let mut w1 = self.w1.load(Acquire);
+        while w1 == 0 {
             std::hint::spin_loop();
+            w1 = self.w1.load(Acquire);
         }
-        self.get()
+        let inline = be7(self.w0.load(Relaxed));
+        if (w1 >> 56) == 0xFF {
+            w1 & 0x00FF_FFFF_FFFF_FFFF
+        } else {
+            inline
+        }
     }
     #[inline(always)]
     fn is_long(&self) -> bool {
@@ -1417,7 +1433,10 @@ fn uf_find(parent: &[AtomicU32], mut x: u32) -> u32 {
         let p = p - 1;
         let gp = parent[p as usize].load(Relaxed);
         if gp != 0 {
-            let _ = parent[x as usize].compare_exchange_weak(p + 1, gp, Relaxed, Relaxed);
+            // path halving with a plain store: x is no root (no union writes it), and gp, an
+            // ancestor of x, stays one, so a racing halving that this store undoes loses
+            // nothing but a shortcut
+            parent[x as usize].store(gp, Relaxed);
         }
         x = p;
     }
@@ -1435,9 +1454,11 @@ fn uf_union(ids: &Ids, parent: &[AtomicU32], a: u32, b: u32) {
         if a == b {
             return;
         }
-        let na = ids.prefs[a as usize].get_sync();
-        let nb = ids.prefs[b as usize].get_sync();
-        let (hi, lo) = if na > nb { (a, b) } else { (b, a) };
+        let (pa, pb) = (&ids.prefs[a as usize], &ids.prefs[b as usize]);
+        let (ka, kb) = (pa.key7_sync(), pb.key7_sync());
+        // the 7-byte keys settle nearly every pair; only ties read the full IDs
+        let a_gt = if ka != kb { ka > kb } else { pa.get() > pb.get() };
+        let (hi, lo) = if a_gt { (a, b) } else { (b, a) };
         if parent[hi as usize].compare_exchange(0, lo + 1, AcqRel, Relaxed).is_ok() {
             return;
         }
@@ -2028,6 +2049,7 @@ struct PersonWork {
     cat_sum: Vec<u64>,
     wcnt: Vec<u32>,
     wpos: Vec<u32>,
+    since: Vec<u32>, // an active campaign's first session (person-local index) not yet counted
     active: Vec<u32>,
     plist: Vec<u32>,
     credited: Vec<[i64; 3]>,
@@ -2362,6 +2384,10 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
         let mut d_events = 0i64;
         let mut d_rev = 0i64;
         let mut d_purch = false;
+        // assisted sessions are counted lazily: an active campaign c owes `sc - since[c]`
+        // sessions to the current day, paid when it leaves the window, the day changes or the
+        // person ends (so a session costs nothing per active campaign)
+        let mut sc = 0u32;
         let mut k = 0usize;
         while k < n {
             let start = (*evs.get_unchecked(k) >> 32) as u32;
@@ -2372,6 +2398,12 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
             if day != cur_day {
                 if cur_day != i64::MIN {
                     flush_day(ud, (cur_day - ctx.first_day) as u32, d_sessions, d_events, d_rev, d_purch, &mut w.cat_sum, cat_names);
+                    let od = (cur_day - ctx.first_day) as usize;
+                    for &c in w.active.iter() {
+                        let c = c as usize;
+                        *w.assisted.get_unchecked_mut(c * ndays + od) += sc - *w.since.get_unchecked(c);
+                        *w.since.get_unchecked_mut(c) = sc;
+                    }
                 }
                 cur_day = day;
                 d_sessions = 0;
@@ -2408,6 +2440,7 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
                     let x = *w.wcnt.get_unchecked(c);
                     if x == 0 {
                         *w.wpos.get_unchecked_mut(c) = w.active.len() as u32;
+                        *w.since.get_unchecked_mut(c) = sc;
                         w.active.push(c as u32);
                     }
                     *w.wcnt.get_unchecked_mut(c) = x + 1;
@@ -2419,6 +2452,7 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
                     let x = *w.wcnt.get_unchecked(c) - 1;
                     *w.wcnt.get_unchecked_mut(c) = x;
                     if x == 0 {
+                        *w.assisted.get_unchecked_mut(c * ndays + dayidx) += sc - *w.since.get_unchecked(c);
                         let pos = *w.wpos.get_unchecked(c) as usize;
                         let last = w.active.pop().unwrap_unchecked();
                         if last as usize != c {
@@ -2427,21 +2461,6 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
                         }
                     }
                     lo += 1;
-                }
-                // the window rarely holds more than 4 campaigns: those take a fixed, branch-free
-                // pass (unused lanes add 0 to slot 0), the rest a loop
-                let na = w.active.len();
-                if na <= 4 {
-                    let ap = w.active.as_ptr();
-                    for q in 0..4 {
-                        let on = q < na;
-                        let c = if on { *ap.add(q.min(na.max(1) - 1)) as usize } else { 0 };
-                        *w.assisted.get_unchecked_mut(c * ndays + dayidx) += on as u32;
-                    }
-                } else {
-                    for &c in w.active.iter() {
-                        *w.assisted.get_unchecked_mut(c as usize * ndays + dayidx) += 1;
-                    }
                 }
                 if hi > lo {
                     let mut bi = hi - 1;
@@ -2462,10 +2481,14 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
             cc[0] += 1;
             cc[1] += (rev > 0) as i64;
             cc[2] += rev;
+            sc += 1;
             k = m;
         }
+        let ld = (cur_day - ctx.first_day) as usize;
         for &c in w.active.iter() {
-            *w.wcnt.get_unchecked_mut(c as usize) = 0;
+            let c = c as usize;
+            *w.assisted.get_unchecked_mut(c * ndays + ld) += sc - *w.since.get_unchecked(c);
+            *w.wcnt.get_unchecked_mut(c) = 0;
         }
         w.active.clear();
         flush_day(ud, (cur_day - ctx.first_day) as u32, d_sessions, d_events, d_rev, d_purch, &mut w.cat_sum, cat_names);
@@ -2882,6 +2905,7 @@ fn main() {
                         cat_sum: vec![0; ctx.ncat],
                         wcnt: vec![0; ctx.ncamp + 1],
                         wpos: vec![0; ctx.ncamp + 1],
+                        since: vec![0; ctx.ncamp + 1],
                         active: Vec::with_capacity(ctx.ncamp + 1),
                         plist: Vec::new(),
                         credited: vec![[0; 3]; (ctx.ncamp + 1) * ctx.ndays],
@@ -3084,6 +3108,38 @@ mod tests {
                 e.set(mkref(unsafe { buf.as_ptr().add(off) }, n));
                 assert_eq!(e.get(), &buf[off..off + n], "n={n} off={off}");
                 assert_eq!(e.is_long(), n > 15);
+            }
+        }
+    }
+
+    #[test]
+    fn name_key7_orders_like_bytes() {
+        let mut r = Rng(0x5eed_1234);
+        let alpha = [0u8, b'0', b'9', b'a', b'u', b'z', 0xFF];
+        let mut buf: Vec<u8> = Vec::new();
+        let mut spans = Vec::new();
+        for _ in 0..400 {
+            let n = 1 + (r.next() % 40) as usize;
+            let s = buf.len();
+            for _ in 0..n {
+                buf.push(alpha[(r.next() % alpha.len() as u64) as usize]);
+            }
+            spans.push((s, n));
+        }
+        buf.extend_from_slice(&[0u8; 64]);
+        let buf: &'static [u8] = Box::leak(buf.into_boxed_slice());
+        let names: &'static [Name] = zeroed::<Name>(spans.len());
+        for (i, &(s, n)) in spans.iter().enumerate() {
+            names[i].set(mkref(unsafe { buf.as_ptr().add(s) }, n));
+        }
+        for i in 0..spans.len() {
+            for j in 0..spans.len() {
+                let (a, b) = (&names[i], &names[j]);
+                let (ka, kb) = (a.key7_sync(), b.key7_sync());
+                let want = a.get() > b.get();
+                if ka != kb {
+                    assert_eq!(ka > kb, want, "{:?} {:?}", a.get(), b.get());
+                }
             }
         }
     }
