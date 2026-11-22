@@ -1675,19 +1675,11 @@ struct ThreadOut {
     tid: u32,
     pq: [[Pending; BATCH]; 4], // by ts form
     pn: [usize; 4],
+    pt: usize, // rows pending in all queues
     flat: Flat,
 }
 
 impl ThreadOut {
-    #[inline(never)]
-    fn flush_events(&mut self, k: usize, ctx: &Ctx) {
-        match k {
-            0 => self.finish_events::<0>(ctx),
-            1 => self.finish_events::<1>(ctx),
-            2 => self.finish_events::<2>(ctx),
-            _ => self.finish_events::<3>(ctx),
-        }
-    }
     /// Parses the queued rows' ts, drops those outside the window or ingested over a day
     /// after it, and buckets the rest by person.
     #[inline(always)]
@@ -1707,6 +1699,8 @@ impl ThreadOut {
             self.pe.push((pid >> ctx.pshift) as usize, PRec { pid, ts: (ts - ctx.base) as u32, pc: e.pc, rowid: e.rowid });
         }
     }
+    /// Queues a row (its person's ID slot prefetched); every 64 rows all queues are
+    /// flushed, so each slot is used about 64 rows after its prefetch, whatever the form.
     #[inline(always)]
     fn push_pending(&mut self, p: Pending, ctx: &Ctx) {
         let k = ts_form(p.tsn as usize);
@@ -1715,15 +1709,19 @@ impl ThreadOut {
             let m = *self.pn.get_unchecked(k);
             *self.pq.get_unchecked_mut(k).get_unchecked_mut(m) = p;
             *self.pn.get_unchecked_mut(k) = m + 1;
-            if m + 1 == BATCH {
-                self.flush_events(k, ctx);
-            }
+        }
+        self.pt += 1;
+        if self.pt == BATCH {
+            self.flush_all_events(ctx);
         }
     }
+    #[inline(never)]
     fn flush_all_events(&mut self, ctx: &Ctx) {
-        for k in 0..4 {
-            self.flush_events(k, ctx);
-        }
+        self.pt = 0;
+        self.finish_events::<0>(ctx);
+        self.finish_events::<1>(ctx);
+        self.finish_events::<2>(ctx);
+        self.finish_events::<3>(ctx);
     }
 }
 
@@ -1740,17 +1738,17 @@ struct PendingClick {
 struct ClickBatch {
     q: [[PendingClick; BATCH]; 4], // by ts form
     n: [usize; 4],
+    t: usize, // clicks pending in all queues
 }
 
 impl ClickBatch {
     #[inline(never)]
-    fn flush(&mut self, k: usize, ctx: &Ctx, out: &mut ThreadOut) {
-        match k {
-            0 => self.finish::<0>(ctx, out),
-            1 => self.finish::<1>(ctx, out),
-            2 => self.finish::<2>(ctx, out),
-            _ => self.finish::<3>(ctx, out),
-        }
+    fn flush(&mut self, ctx: &Ctx, out: &mut ThreadOut) {
+        self.t = 0;
+        self.finish::<0>(ctx, out);
+        self.finish::<1>(ctx, out);
+        self.finish::<2>(ctx, out);
+        self.finish::<3>(ctx, out);
     }
     /// Parses the queued clicks' ts, drops those outside [window start - 7 days, window end),
     /// and buckets the rest by person.
@@ -1776,9 +1774,10 @@ impl ClickBatch {
             let m = *self.n.get_unchecked(k);
             *self.q.get_unchecked_mut(k).get_unchecked_mut(m) = p;
             *self.n.get_unchecked_mut(k) = m + 1;
-            if m + 1 == BATCH {
-                self.flush(k, ctx, out);
-            }
+        }
+        self.t += 1;
+        if self.t == BATCH {
+            self.flush(ctx, out);
         }
     }
 }
@@ -1845,7 +1844,7 @@ unsafe fn parse_events(ctx: &Ctx, chunk: &'static [u8], out: &mut ThreadOut) {
 }
 
 unsafe fn parse_clicks(ctx: &Ctx, chunk: &'static [u8], out: &mut ThreadOut) {
-    let mut ring = ClickBatch { q: [[PendingClick::default(); BATCH]; 4], n: [0; 4] };
+    let mut ring = ClickBatch { q: [[PendingClick::default(); BATCH]; 4], n: [0; 4], t: 0 };
     let mut flat = std::mem::replace(&mut out.flat, Flat::new());
     for_lines::<4>(&mut flat, chunk, |fp, fl| {
         if fl[0] == 0 || fl[1] == 0 {
@@ -1859,9 +1858,7 @@ unsafe fn parse_clicks(ctx: &Ctx, chunk: &'static [u8], out: &mut ThreadOut) {
         ring.push(PendingClick { uhash, uref: mkref(fp[1], fl[1]), kref: mkref(fp[0], fl[0]), tsp: fp[3] as u64, tsn: fl[3] as u32, camp }, ctx, out);
     });
     out.flat = flat;
-    for k in 0..4 {
-        ring.flush(k, ctx, out);
-    }
+    ring.flush(ctx, out);
 }
 
 // ---------------------------------------------------------------- output buffers
@@ -2501,6 +2498,7 @@ fn main() {
                         tid: t as u32,
                         pq: [[Pending::default(); BATCH]; 4],
                         pn: [0; 4],
+                        pt: 0,
                         flat: Flat::new(),
                     };
                     loop {
