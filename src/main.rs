@@ -168,6 +168,40 @@ fn map_file(path: &Path) -> &'static [u8] {
     }
 }
 
+/// Maps a file read-only at `at`, inside a readable reservation made by the caller.
+fn map_file_at(path: &Path, at: *mut u8) -> &'static [u8] {
+    let f = File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+    let len = f.metadata().unwrap().len() as usize;
+    if len == 0 {
+        return &[];
+    }
+    unsafe {
+        let p = mmap(at, len, PROT_READ, MAP_PRIVATE | MAP_FIXED, f.as_raw_fd(), 0);
+        if p as isize == -1 || p != at {
+            panic!("mmap failed for {}", path.display());
+        }
+        std::slice::from_raw_parts(p, len)
+    }
+}
+
+/// Start of the one reservation holding every clicks file: a click's ID is kept as a u32
+/// offset from it.
+static CLICK_BASE: AtomicUsize = AtomicUsize::new(0);
+
+/// The click ID at offset `off` from CLICK_BASE: its bytes up to the ',' or '"' after it
+/// (a well-formed line's ID holds neither).
+#[inline]
+fn click_id(off: u32) -> &'static [u8] {
+    unsafe {
+        let p = (CLICK_BASE.load(Relaxed) + off as usize) as *const u8;
+        let mut n = 0;
+        while !matches!(*p.add(n), b',' | b'"' | b'\n') {
+            n += 1;
+        }
+        std::slice::from_raw_parts(p, n)
+    }
+}
+
 /// Zeroed anonymous memory with transparent huge pages requested.
 fn zeroed<T>(n: usize) -> &'static mut [T] {
     let bytes = (n * std::mem::size_of::<T>()).max(1);
@@ -1504,10 +1538,12 @@ fn build_links(ids: &Ids, link_chunks: &[&'static [u8]], nthreads: usize) {
                                 _mm_prefetch(ids.slot_ptr(hb) as *const i8, _MM_HINT_T0);
                                 // and the names of the slots' groups (one line per group of 4):
                                 // a new ID's name store then hits, so the slot CAS (a locked
-                                // instruction, which waits for every earlier store) waits on nothing
+                                // instruction, which waits for every earlier store) waits on nothing.
+                                // A read prefetch: a line no other core holds arrives exclusive anyway,
+                                // and other threads' compares read these lines too
                                 if PF_NAMES {
-                                    _mm_prefetch(ids.name_ptr(ha) as *const i8, _MM_HINT_ET0);
-                                    _mm_prefetch(ids.name_ptr(hb) as *const i8, _MM_HINT_ET0);
+                                    _mm_prefetch(ids.name_ptr(ha) as *const i8, _MM_HINT_T0);
+                                    _mm_prefetch(ids.name_ptr(hb) as *const i8, _MM_HINT_T0);
                                 }
                                 batch.push((ha, mkref(fp[0], fl[0]), hb, mkref(fp[1], fl[1])));
                                 if batch.len() == LB {
@@ -1690,8 +1726,7 @@ struct CRec {
     pid: u32,
     ts: u32,
     camp: u32,
-    _pad: u32,
-    kref: u64,
+    koff: u32, // the click ID (click_id)
 }
 
 const LPD: usize = 24;
@@ -1836,10 +1871,10 @@ impl ThreadOut {
 struct PendingClick {
     uhash: u64,
     uref: u64,
-    kref: u64,
     tsp: u64,
     tsn: u32,
     camp: u32,
+    koff: u32,
 }
 
 struct ClickBatch {
@@ -1870,7 +1905,7 @@ impl ClickBatch {
                 continue;
             }
             let pid = ctx.ids.person(e.uhash, e.uref);
-            out.pc.push((pid >> ctx.pshift) as usize, CRec { pid, ts: (ts - ctx.base) as u32, camp: e.camp, _pad: 0, kref: e.kref });
+            out.pc.push((pid >> ctx.pshift) as usize, CRec { pid, ts: (ts - ctx.base) as u32, camp: e.camp, koff: e.koff });
         }
     }
     #[inline(always)]
@@ -1962,6 +1997,7 @@ unsafe fn parse_events(ctx: &Ctx, chunk: &'static [u8], out: &mut ThreadOut) {
 }
 
 unsafe fn parse_clicks(ctx: &Ctx, chunk: &'static [u8], out: &mut ThreadOut) {
+    let cbase = CLICK_BASE.load(Relaxed);
     let mut ring = ClickBatch { q: [[PendingClick::default(); BATCH]; 4], n: [0; 4], t: 0 };
     let mut flat = std::mem::replace(&mut out.flat, Flat::new());
     for_lines::<4>(&mut flat, chunk, |fp, fl| {
@@ -1973,7 +2009,7 @@ unsafe fn parse_clicks(ctx: &Ctx, chunk: &'static [u8], out: &mut ThreadOut) {
             return;
         }
         let uhash = hash_ptr(fp[1], fl[1]);
-        ring.push(PendingClick { uhash, uref: mkref(fp[1], fl[1]), kref: mkref(fp[0], fl[0]), tsp: fp[3] as u64, tsn: fl[3] as u32, camp }, ctx, out);
+        ring.push(PendingClick { uhash, uref: mkref(fp[1], fl[1]), tsp: fp[3] as u64, tsn: fl[3] as u32, camp, koff: (fp[0] as usize - cbase) as u32 }, ctx, out);
     });
     out.flat = flat;
     ring.flush(ctx, out);
@@ -2020,7 +2056,7 @@ fn put_str(buf: &mut Vec<u8>, s: &[u8]) {
 #[derive(Clone, Copy)]
 struct CKey {
     key: u64, // ts << 32 | camp
-    kref: u64,
+    kref: u64, // the click ID's offset (click_id)
 }
 
 struct PersonWork {
@@ -2305,7 +2341,7 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
                 let p = (c.pid - lo_pid) as usize;
                 let at = *w.ccnt.get_unchecked(p);
                 *w.ccnt.get_unchecked_mut(p) = at + 1;
-                *w.ck.get_unchecked_mut(at as usize) = CKey { key: ((c.ts as u64) << 32) | c.camp as u64, kref: c.kref };
+                *w.ck.get_unchecked_mut(at as usize) = CKey { key: ((c.ts as u64) << 32) | c.camp as u64, kref: c.koff as u64 };
             }
         }
     }
@@ -2313,7 +2349,7 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
     TM[1].fetch_add(tq.elapsed().as_nanos() as u64, Relaxed);
     let tq = Instant::now();
     let base = ctx.base;
-    let ndays = ctx.ndays;
+    let _ndays = ctx.ndays;
     let organic = ctx.ncamp;
     let prefs = ctx.ids.prefs;
     w.plist.clear();
@@ -2399,6 +2435,8 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
             d_events += (m - k) as i64;
             d_rev += rev;
             let dayidx = (day - ctx.first_day) as usize;
+            // counters are [day][campaign]: a day's row stays in L1 while its sessions run
+            let drow = dayidx * (organic + 1);
             let camp = if nc == 0 {
                 organic
             } else {
@@ -2436,11 +2474,11 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
                     for q in 0..4 {
                         let on = q < na;
                         let c = if on { *ap.add(q.min(na.max(1) - 1)) as usize } else { 0 };
-                        *w.assisted.get_unchecked_mut(c * ndays + dayidx) += on as u32;
+                        *w.assisted.get_unchecked_mut(drow + c) += on as u32;
                     }
                 } else {
                     for &c in w.active.iter() {
-                        *w.assisted.get_unchecked_mut(c as usize * ndays + dayidx) += 1;
+                        *w.assisted.get_unchecked_mut(drow + c as usize) += 1;
                     }
                 }
                 if hi > lo {
@@ -2449,7 +2487,7 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
                     let mut x = bi;
                     while x > lo && (clicks.get_unchecked(x - 1).key >> 32) == t {
                         x -= 1;
-                        if deref(clicks.get_unchecked(x).kref) < deref(clicks.get_unchecked(bi).kref) {
+                        if click_id(clicks.get_unchecked(x).kref as u32) < click_id(clicks.get_unchecked(bi).kref as u32) {
                             bi = x;
                         }
                     }
@@ -2458,7 +2496,7 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
                     organic
                 }
             };
-            let cc = w.credited.get_unchecked_mut(camp * ndays + dayidx);
+            let cc = w.credited.get_unchecked_mut(drow + camp);
             cc[0] += 1;
             cc[1] += (rev > 0) as i64;
             cc[2] += rev;
@@ -2592,6 +2630,27 @@ fn main() {
     let ln_paths = csv_files(&data_dir.join("links"));
     let all_paths: Vec<&PathBuf> = ev_paths.iter().chain(ck_paths.iter()).chain(ln_paths.iter()).collect();
     let mapped: Vec<AtomicU64> = (0..all_paths.len() * 2).map(|_| AtomicU64::new(0)).collect();
+    // clicks files share one reservation (each at a page boundary, a zero page after the last),
+    // so a click's ID fits a u32 offset
+    let ck_lo = ev_paths.len();
+    let mut ck_off: Vec<usize> = Vec::with_capacity(ck_paths.len());
+    let mut ck_total = 0usize;
+    for p in &ck_paths {
+        ck_off.push(ck_total);
+        let len = fs::metadata(p).map(|m| m.len() as usize).unwrap_or(0);
+        ck_total += (len + 4095) / 4096 * 4096;
+    }
+    ck_total += 4096;
+    assert!(ck_total < (1usize << 32), "clicks over 4 GB");
+    let ck_base = unsafe {
+        let b = mmap(std::ptr::null_mut(), ck_total, PROT_READ, MAP_PRIVATE | MAP_ANON, -1, 0);
+        if b as isize == -1 {
+            panic!("mmap anon failed");
+        }
+        note_region(b, ck_total);
+        b as usize
+    };
+    CLICK_BASE.store(ck_base, Relaxed);
     {
         let next = AtomicUsize::new(0);
         std::thread::scope(|s| {
@@ -2601,7 +2660,11 @@ fn main() {
                     if j >= all_paths.len() {
                         break;
                     }
-                    let m = map_file(all_paths[j]);
+                    let m = if j >= ck_lo && j < ck_lo + ck_paths.len() {
+                        map_file_at(all_paths[j], (ck_base + ck_off[j - ck_lo]) as *mut u8)
+                    } else {
+                        map_file(all_paths[j])
+                    };
                     mapped[2 * j].store(m.as_ptr() as u64, Relaxed);
                     mapped[2 * j + 1].store(m.len() as u64, Relaxed);
                 });
@@ -2729,7 +2792,7 @@ fn main() {
             for o in outs.iter() {
                 for b in 0..o.dk.cur.len() { u += o.dk.len(b) * 16; c += o.dk.chunks[b].len() * o.dk.ch * 16; }
                 for b in 0..o.pe.cur.len() { u2 += o.pe.len(b) * 12; c += o.pe.chunks[b].len() * o.pe.ch * 12; }
-                for b in 0..o.pc.cur.len() { u3 += o.pc.len(b) * 24; c += o.pc.chunks[b].len() * o.pc.ch * 24; }
+                for b in 0..o.pc.cur.len() { u3 += o.pc.len(b) * 16; c += o.pc.chunks[b].len() * o.pc.ch * 16; }
             }
             eprintln!("  mem dk {:.0} pe {:.0} pc {:.0} MB used, {:.0} MB in chunks, ids {:.0} MB, rows {:?}", mb(u), mb(u2), mb(u3), mb(c), mb(ctx.ids.mask as usize * 16), outs.iter().map(|o| (0..NEB).map(|b| o.dk.len(b)).sum::<usize>()).collect::<Vec<_>>());
         }
@@ -2981,7 +3044,7 @@ fn main() {
             let (mut cid, mut ch, mut day, mut s0, mut s1, mut s2, mut s3) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
             for c in 0..=ncamp {
                 for d in 0..ndays {
-                    let v = camp_total[c * ndays + d];
+                    let v = camp_total[d * (ncamp + 1) + c];
                     if v[0] == 0 && v[3] == 0 {
                         continue;
                     }
