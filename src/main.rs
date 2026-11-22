@@ -698,6 +698,49 @@ unsafe fn parse_f12_simd<const F2: bool>(p: *const u8) -> i64 {
     }
 }
 
+/// `parse_f12_simd::<false>` in whole seconds (BAD_TS when bad): the `Z` form has no
+/// sub-second part, so this is exactly its value / 1000.
+#[inline(always)]
+unsafe fn parse_z_secs(p: *const u8) -> i64 {
+    const PA: __m128i = v128(*b"0000-00-00T00:00");
+    const LA: __m128i = v128([9, 9, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9]);
+    const PB1: __m128i = v128(*b"-00-00T00:00:00Z");
+    const LB1: __m128i = v128([0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0]);
+    const SHA: __m128i = v128([0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 0x80, 0x80, 0x80, 0x80]);
+    const SHB: __m128i = v128([0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 13, 14, 0x80, 0x80]);
+    const W10: __m128i = v128([10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1]);
+    const LO: __m128i = w128([19, 0, 1, 1, 0, 0, 0, 0]);
+    const HI: __m128i = w128([22, 99, 12, 31, 23, 59, 59, 0]);
+    const WM: __m128i = w128([1600, 16, 1, 0, 3600, 60, 1, 0]);
+    let a = _mm_loadu_si128(p as *const __m128i);
+    let b = _mm_loadu_si128(p.add(4) as *const __m128i);
+    let xa = _mm_xor_si128(a, PA);
+    let xb = _mm_xor_si128(b, PB1);
+    let ok = _mm_and_si128(_mm_cmpeq_epi8(_mm_max_epu8(xa, LA), LA), _mm_cmpeq_epi8(_mm_max_epu8(xb, LB1), LB1));
+    if _mm_movemask_epi8(ok) != 0xFFFF {
+        return BAD_TS;
+    }
+    let v = _mm_or_si128(_mm_shuffle_epi8(xa, SHA), _mm_shuffle_epi8(xb, SHB));
+    let vals = _mm_maddubs_epi16(v, W10); // [YY, YY, MM, DD, hh, mm, ss, 0]
+    let bad = _mm_or_si128(_mm_cmpgt_epi16(LO, vals), _mm_cmpgt_epi16(vals, HI));
+    if _mm_movemask_epi8(bad) != 0 {
+        // out-of-table year (exact slow path) or a bad field
+        return match parse_iso(sl(p, 20)) {
+            Some(ms) => ms.div_euclid(1000),
+            None => BAD_TS,
+        };
+    }
+    let r = _mm_madd_epi16(vals, WM); // [ym16, month, hh*3600 + mm*60, ss]
+    let ym = _mm_cvtsi128_si32(r) + _mm_extract_epi32::<1>(r) - 1900 * 16;
+    let hms = _mm_extract_epi32::<2>(r) + _mm_extract_epi32::<3>(r);
+    let d = _mm_extract_epi16::<3>(vals);
+    let packed = *TBL16.get_unchecked(ym as usize);
+    if (d - 1) as u32 >= (packed & 0xFF) as u32 {
+        return BAD_TS;
+    }
+    ((packed >> 8) + d - 1) as i64 * 86_400 + hms as i64
+}
+
 /// Any timestamp form; BAD_TS when bad.
 #[inline(always)]
 unsafe fn parse_ts_fast(p: *const u8, n: usize) -> i64 {
@@ -1576,13 +1619,52 @@ fn ebucket(h: u64) -> usize {
     (h >> (64 - EB_BITS)) as usize
 }
 
+/// Queue of a `ts` field's form: 0 = ISO `Z` (20 bytes), 1 = epoch ms (13), 2 = ISO offset
+/// (25), 3 = anything else. Rows wait in one queue per form, so each queue is parsed by one
+/// form's code: the form, random from row to row, costs no branch mispredict.
+#[inline(always)]
+fn ts_form(n: usize) -> usize {
+    const F: [u8; 32] = {
+        let mut f = [3u8; 32];
+        f[20] = 0;
+        f[13] = 1;
+        f[25] = 2;
+        f
+    };
+    F[n.min(31)] as usize
+}
+
+/// Parses a `ts` field of form `F` (see ts_form); BAD_TS when bad.
+#[inline(always)]
+unsafe fn parse_ts_form<const F: usize>(p: *const u8, n: usize) -> i64 {
+    match F {
+        0 => parse_f12_simd::<false>(p),
+        1 => {
+            let a = std::ptr::read_unaligned(p as *const u64);
+            let b = std::ptr::read_unaligned(p.add(5) as *const u64);
+            if all_digits(a) & all_digits(b) {
+                (parse8(a) * 100_000 + parse8(b) % 100_000) as i64
+            } else {
+                BAD_TS
+            }
+        }
+        2 => parse_f12_simd::<true>(p),
+        _ => match parse_ts(sl(p, n)) {
+            Some(t) => t,
+            None => BAD_TS,
+        },
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct Pending {
     uhash: u64,
     uref: u64,
-    a: u32,
-    b: u32,
-    c: u32,
+    tsp: u64, // the ts field
+    ingest: i64,
+    tsn: u32,
+    pc: u32,
+    rowid: u32,
 }
 
 struct ThreadOut {
@@ -1591,31 +1673,56 @@ struct ThreadOut {
     pc: Buckets<CRec>,
     rows: u32,
     tid: u32,
-    batch: [Pending; BATCH],
-    bn: usize,
+    pq: [[Pending; BATCH]; 4], // by ts form
+    pn: [usize; 4],
     flat: Flat,
 }
 
 impl ThreadOut {
     #[inline(never)]
-    fn flush_events(&mut self, ctx: &Ctx) {
-        let n = self.bn;
-        self.bn = 0;
+    fn flush_events(&mut self, k: usize, ctx: &Ctx) {
+        match k {
+            0 => self.finish_events::<0>(ctx),
+            1 => self.finish_events::<1>(ctx),
+            2 => self.finish_events::<2>(ctx),
+            _ => self.finish_events::<3>(ctx),
+        }
+    }
+    /// Parses the queued rows' ts, drops those outside the window or ingested over a day
+    /// after it, and buckets the rest by person.
+    #[inline(always)]
+    fn finish_events<const F: usize>(&mut self, ctx: &Ctx) {
+        let n = self.pn[F];
+        self.pn[F] = 0;
         for i in 0..n {
-            let e = unsafe { *self.batch.get_unchecked(i) };
+            let e = unsafe { *self.pq[F].get_unchecked(i) };
+            let ts = unsafe { parse_ts_form::<F>(e.tsp as *const u8, e.tsn as usize) };
+            if ts < ctx.ws || ts >= ctx.we {
+                continue;
+            }
+            if e.ingest == BAD_TS || e.ingest - ts > DAY {
+                continue;
+            }
             let pid = ctx.ids.person(e.uhash, e.uref);
-            self.pe.push((pid >> ctx.pshift) as usize, PRec { pid, ts: e.a, pc: e.b, rowid: e.c });
+            self.pe.push((pid >> ctx.pshift) as usize, PRec { pid, ts: (ts - ctx.base) as u32, pc: e.pc, rowid: e.rowid });
         }
     }
     #[inline(always)]
     fn push_pending(&mut self, p: Pending, ctx: &Ctx) {
+        let k = ts_form(p.tsn as usize);
         unsafe {
             _mm_prefetch(ctx.ids.slot_ptr(p.uhash) as *const i8, _MM_HINT_T0);
-            *self.batch.get_unchecked_mut(self.bn) = p;
+            let m = *self.pn.get_unchecked(k);
+            *self.pq.get_unchecked_mut(k).get_unchecked_mut(m) = p;
+            *self.pn.get_unchecked_mut(k) = m + 1;
+            if m + 1 == BATCH {
+                self.flush_events(k, ctx);
+            }
         }
-        self.bn += 1;
-        if self.bn == BATCH {
-            self.flush_events(ctx);
+    }
+    fn flush_all_events(&mut self, ctx: &Ctx) {
+        for k in 0..4 {
+            self.flush_events(k, ctx);
         }
     }
 }
@@ -1625,66 +1732,92 @@ struct PendingClick {
     uhash: u64,
     uref: u64,
     kref: u64,
-    ts: u32,
+    tsp: u64,
+    tsn: u32,
     camp: u32,
 }
 
 struct ClickBatch {
-    batch: [PendingClick; BATCH],
-    bn: usize,
+    q: [[PendingClick; BATCH]; 4], // by ts form
+    n: [usize; 4],
 }
 
 impl ClickBatch {
     #[inline(never)]
-    fn flush(&mut self, ctx: &Ctx, out: &mut ThreadOut) {
-        let n = self.bn;
-        self.bn = 0;
+    fn flush(&mut self, k: usize, ctx: &Ctx, out: &mut ThreadOut) {
+        match k {
+            0 => self.finish::<0>(ctx, out),
+            1 => self.finish::<1>(ctx, out),
+            2 => self.finish::<2>(ctx, out),
+            _ => self.finish::<3>(ctx, out),
+        }
+    }
+    /// Parses the queued clicks' ts, drops those outside [window start - 7 days, window end),
+    /// and buckets the rest by person.
+    #[inline(always)]
+    fn finish<const F: usize>(&mut self, ctx: &Ctx, out: &mut ThreadOut) {
+        let n = self.n[F];
+        self.n[F] = 0;
         for i in 0..n {
-            let e = unsafe { *self.batch.get_unchecked(i) };
+            let e = unsafe { *self.q[F].get_unchecked(i) };
+            let ts = unsafe { parse_ts_form::<F>(e.tsp as *const u8, e.tsn as usize) };
+            if ts < ctx.base || ts >= ctx.we {
+                continue;
+            }
             let pid = ctx.ids.person(e.uhash, e.uref);
-            out.pc.push((pid >> ctx.pshift) as usize, CRec { pid, ts: e.ts, camp: e.camp, _pad: 0, kref: e.kref });
+            out.pc.push((pid >> ctx.pshift) as usize, CRec { pid, ts: (ts - ctx.base) as u32, camp: e.camp, _pad: 0, kref: e.kref });
         }
     }
     #[inline(always)]
     fn push(&mut self, p: PendingClick, ctx: &Ctx, out: &mut ThreadOut) {
+        let k = ts_form(p.tsn as usize);
         unsafe {
             _mm_prefetch(ctx.ids.slot_ptr(p.uhash) as *const i8, _MM_HINT_T0);
-            *self.batch.get_unchecked_mut(self.bn) = p;
-        }
-        self.bn += 1;
-        if self.bn == BATCH {
-            self.flush(ctx, out);
+            let m = *self.n.get_unchecked(k);
+            *self.q.get_unchecked_mut(k).get_unchecked_mut(m) = p;
+            *self.n.get_unchecked_mut(k) = m + 1;
+            if m + 1 == BATCH {
+                self.flush(k, ctx, out);
+            }
         }
     }
 }
 
 unsafe fn parse_events(ctx: &Ctx, chunk: &'static [u8], out: &mut ThreadOut) {
-    let ws = ctx.ws;
-    let we = ctx.we;
     let base = ctx.base;
+    // the seconds path gives the same ingest_rel as the ms path only when base is a whole
+    // second (it is when the manifest's window bounds are ISO timestamps)
+    let base_secs = base.div_euclid(1000);
+    let zfast = base.rem_euclid(1000) == 0;
     let mut flat = std::mem::replace(&mut out.flat, Flat::new());
     for_lines::<7>(&mut flat, chunk, |fp, fl| {
         if fl[0] == 0 {
             return;
         }
         let ehash = hash_ptr(fp[0], fl[0]);
-        let ingest = parse_ts_fast(fp[3], fl[3]);
+        // ingest_ts: always the `Z` form in practice, parsed straight to seconds
+        let (ingest, ingest_rel) = if zfast & (fl[3] == 20) {
+            let secs = parse_z_secs(fp[3]);
+            if secs == BAD_TS {
+                (BAD_TS, i32::MAX)
+            } else {
+                (secs * 1000, (secs - base_secs).clamp(i32::MIN as i64, (i32::MAX - 1) as i64) as i32)
+            }
+        } else {
+            let ingest = parse_ts_fast(fp[3], fl[3]);
+            (ingest, if ingest == BAD_TS { i32::MAX } else { ((ingest - base).div_euclid(1000)).clamp(i32::MIN as i64, (i32::MAX - 1) as i64) as i32 })
+        };
         let rowid = (out.tid << 27) | out.rows;
         out.rows += 1;
-        let ingest_rel = if ingest == BAD_TS { i32::MAX } else { ((ingest - base).div_euclid(1000)).clamp(i32::MIN as i64, (i32::MAX - 1) as i64) as i32 };
         out.dk.push(ebucket(ehash), DKey { ehash, ingest: ingest_rel, rowid });
         // validation
         if fl[1] == 0 || fl[5] == 0 {
             return;
         }
-        let ts = parse_ts_fast(fp[2], fl[2]);
-        if ts < ws || ts >= we {
-            return;
-        }
         let mut pc = 0u32;
         if fl[4] == 4 {
             let w = std::ptr::read_unaligned(fp[4] as *const u32);
-            if w != u32::from_le_bytes(*b"view") && w != u32::from_le_bytes(*b"cart") {
+            if !((w == u32::from_le_bytes(*b"view")) | (w == u32::from_le_bytes(*b"cart"))) {
                 return;
             }
         } else if fl[4] == 8 && std::ptr::read_unaligned(fp[4] as *const u64) == u64::from_le_bytes(*b"purchase") {
@@ -1700,20 +1833,19 @@ unsafe fn parse_events(ctx: &Ctx, chunk: &'static [u8], out: &mut ThreadOut) {
         } else {
             return;
         }
-        if ingest == BAD_TS || ingest - ts > DAY {
+        if ingest == BAD_TS {
             return;
         }
+        // ts (window and ingest-delay checks too) is parsed with its queue, by form
         let uhash = hash_ptr(fp[1], fl[1]);
-        out.push_pending(Pending { uhash, uref: mkref(fp[1], fl[1]), a: (ts - base) as u32, b: pc, c: rowid }, ctx);
+        out.push_pending(Pending { uhash, uref: mkref(fp[1], fl[1]), tsp: fp[2] as u64, ingest, tsn: fl[2] as u32, pc, rowid }, ctx);
     });
     out.flat = flat;
-    out.flush_events(ctx);
+    out.flush_all_events(ctx);
 }
 
 unsafe fn parse_clicks(ctx: &Ctx, chunk: &'static [u8], out: &mut ThreadOut) {
-    let lo = ctx.base;
-    let we = ctx.we;
-    let mut ring = ClickBatch { batch: [PendingClick::default(); BATCH], bn: 0 };
+    let mut ring = ClickBatch { q: [[PendingClick::default(); BATCH]; 4], n: [0; 4] };
     let mut flat = std::mem::replace(&mut out.flat, Flat::new());
     for_lines::<4>(&mut flat, chunk, |fp, fl| {
         if fl[0] == 0 || fl[1] == 0 {
@@ -1723,15 +1855,13 @@ unsafe fn parse_clicks(ctx: &Ctx, chunk: &'static [u8], out: &mut ThreadOut) {
         if camp == ABSENT {
             return;
         }
-        let ts = parse_ts_fast(fp[3], fl[3]);
-        if ts < lo || ts >= we {
-            return;
-        }
         let uhash = hash_ptr(fp[1], fl[1]);
-        ring.push(PendingClick { uhash, uref: mkref(fp[1], fl[1]), kref: mkref(fp[0], fl[0]), ts: (ts - lo) as u32, camp }, ctx, out);
+        ring.push(PendingClick { uhash, uref: mkref(fp[1], fl[1]), kref: mkref(fp[0], fl[0]), tsp: fp[3] as u64, tsn: fl[3] as u32, camp }, ctx, out);
     });
     out.flat = flat;
-    ring.flush(ctx, out);
+    for k in 0..4 {
+        ring.flush(k, ctx, out);
+    }
 }
 
 // ---------------------------------------------------------------- output buffers
@@ -2369,8 +2499,8 @@ fn main() {
                         pc: Buckets::new(npb, per_cb),
                         rows: 0,
                         tid: t as u32,
-                        batch: [Pending::default(); BATCH],
-                        bn: 0,
+                        pq: [[Pending::default(); BATCH]; 4],
+                        pn: [0; 4],
                         flat: Flat::new(),
                     };
                     loop {
