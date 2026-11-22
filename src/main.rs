@@ -2032,11 +2032,91 @@ unsafe fn sort_events<'a>(v: &'a mut [u64], tmp: &mut Vec<u64>, small: &'a mut [
         rank_sort::<4>(v, small);
     } else if n <= 32 {
         rank_sort::<8>(v, small);
+    } else if n < RADIX_MIN {
+        merge_sort_mid(v, tmp, small);
+        return v;
     } else {
         sort_small(v, tmp, |&x| x);
         return v;
     }
     &small[..n]
+}
+
+/// Branch-free sort of 33..RADIX_MIN events (a comparison sort would mispredict about every
+/// other comparison on these random orders): rank-sorted runs of 32, then merges whose
+/// only branches are loop exits.
+#[inline(never)]
+unsafe fn merge_sort_mid(v: &mut [u64], tmp: &mut Vec<u64>, small: &mut [u64; 33]) {
+    let n = v.len();
+    tmp.clear();
+    tmp.reserve(n);
+    tmp.set_len(n);
+    let mut b = 0;
+    while b + 32 <= n {
+        rank32(v.as_ptr().add(b), tmp.as_mut_ptr().add(b));
+        b += 32;
+    }
+    if b < n {
+        rank_sort::<8>(v.get_unchecked(b..n), small);
+        std::ptr::copy_nonoverlapping(small.as_ptr(), tmp.as_mut_ptr().add(b), n - b);
+    }
+    let (mut src, mut dst) = (tmp.as_mut_ptr(), v.as_mut_ptr());
+    let mut width = 32;
+    while width < n {
+        let mut start = 0;
+        while start < n {
+            let mid = (start + width).min(n);
+            let end = (start + 2 * width).min(n);
+            let (mut i, mut j, mut k) = (start, mid, start);
+            while (i < mid) & (j < end) {
+                let a = *src.add(i);
+                let c = *src.add(j);
+                let tb = c < a;
+                *dst.add(k) = if tb { c } else { a };
+                j += tb as usize;
+                i += !tb as usize;
+                k += 1;
+            }
+            std::ptr::copy_nonoverlapping(src.add(i), dst.add(k), mid - i);
+            k += mid - i;
+            std::ptr::copy_nonoverlapping(src.add(j), dst.add(k), end - j);
+            start = end;
+        }
+        std::mem::swap(&mut src, &mut dst);
+        width *= 2;
+    }
+    if src != v.as_mut_ptr() {
+        std::ptr::copy_nonoverlapping(src, v.as_mut_ptr(), n);
+    }
+}
+
+/// `rank_sort::<8>` of exactly 32 events from `v` into `out`, keys built 4 at a time.
+#[inline(always)]
+unsafe fn rank32(v: *const u64, out: *mut u64) {
+    let mut kk = [0i64; 32];
+    let mut blk = [_mm256_setzero_si256(); 8];
+    let mut acc = [_mm256_setzero_si256(); 8];
+    let iota = _mm256_setr_epi64x(0, 1, 2, 3);
+    for m in 0..8 {
+        let x = _mm256_loadu_si256(v.add(4 * m) as *const __m256i);
+        // (ts << 5 | position): unique, positive (ts < 2^31), in (time, position) order
+        let k = _mm256_or_si256(_mm256_slli_epi64::<5>(_mm256_srli_epi64::<32>(x)), _mm256_add_epi64(iota, _mm256_set1_epi64x(4 * m as i64)));
+        blk[m] = k;
+        _mm256_storeu_si256((kk.as_mut_ptr() as *mut __m256i).add(m), k);
+    }
+    for j in 0..32 {
+        let b = _mm256_set1_epi64x(*kk.get_unchecked(j));
+        for m in 0..8 {
+            acc[m] = _mm256_sub_epi64(acc[m], _mm256_cmpgt_epi64(blk[m], b));
+        }
+    }
+    let mut r = [0u64; 32];
+    for m in 0..8 {
+        _mm256_storeu_si256((r.as_mut_ptr() as *mut __m256i).add(m), acc[m]);
+    }
+    for i in 0..32 {
+        *out.add(*r.get_unchecked(i) as usize) = *v.add(i);
+    }
 }
 
 /// Branch-free sort of 2..=4*NB events into `out` (most persons have few): each event's
@@ -3011,6 +3091,26 @@ mod tests {
             let mut g2 = got.clone();
             g2.sort();
             assert_eq!(g2, ms, "same multiset n={n}");
+        }
+    }
+
+    #[test]
+    fn sort_events_orders_times() {
+        let mut r = Rng(0x5EED);
+        let mut tmp = Vec::new();
+        let mut small = [0u64; 33];
+        for it in 0..4000u64 {
+            let n = if it % 3 == 0 { 1 + r.below(40) as usize } else { 1 + r.below(2100) as usize };
+            let spread = [4u64, 100, 1 << 20, 1 << 31][(it % 4) as usize];
+            let v: Vec<u64> = (0..n).map(|_| (r.below(spread) << 32) | r.below(1 << 20)).collect();
+            let mut w = v.clone();
+            let got: Vec<u64> = unsafe { sort_events(&mut w, &mut tmp, &mut small).to_vec() };
+            let mut want = v.clone();
+            want.sort_unstable();
+            let mut g2 = got.clone();
+            g2.sort_unstable();
+            assert_eq!(g2, want, "same multiset, n {n}");
+            assert!(got.windows(2).all(|p| (p[0] >> 32) <= (p[1] >> 32)), "time order, n {n}");
         }
     }
 
