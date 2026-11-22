@@ -1458,21 +1458,37 @@ fn build_links(ids: &Ids, link_chunks: &[&'static [u8]], nthreads: usize) {
 
 // ---------------------------------------------------------------- bucketed output buffers in huge-page arenas
 
+/// Per-thread record buckets: each bucket is a chain of chunks bump-allocated from
+/// huge-page arenas, so only memory that holds records gets touched (no per-bucket
+/// slack), and a big bucket (a whale) just takes bigger chunks.
 struct Buckets<T: Copy + 'static> {
-    base: *mut T,
-    cap: usize,
-    cur: Vec<[*mut T; 2]>, // write pointer, end of the bucket's region
-    spill: Vec<Vec<T>>,
+    cur: Vec<[*mut T; 2]>,          // write pointer, end of the current chunk
+    start: Vec<*mut T>,             // start of the current chunk
+    full: Vec<Vec<(*mut T, usize)>>, // closed chunks
+    next: Vec<u32>,                 // size of the bucket's next chunk
+    first: usize,                   // size of every bucket's first chunk
+    arena: *mut T,
+    left: usize, // elements left in the arena
+    region: usize,
 }
 unsafe impl<T: Copy + 'static> Send for Buckets<T> {}
 unsafe impl<T: Copy + 'static> Sync for Buckets<T> {}
 
 impl<T: Copy + 'static> Buckets<T> {
-    fn new(n: usize, cap: usize) -> Self {
-        let mem = zeroed::<T>(n * cap);
-        let base = mem.as_mut_ptr();
-        let cur = (0..n).map(|b| unsafe { [base.add(b * cap), base.add((b + 1) * cap)] }).collect();
-        Buckets { base, cap, cur, spill: (0..n).map(|_| Vec::new()).collect() }
+    /// `n` buckets expected to hold about `per` records each.
+    fn new(n: usize, per: usize) -> Self {
+        let first = per + per / 8 + 32;
+        let region = (n * first + (4 << 20) / std::mem::size_of::<T>()).max(1 << 16);
+        Buckets {
+            cur: vec![[std::ptr::null_mut(); 2]; n],
+            start: vec![std::ptr::null_mut(); n],
+            full: (0..n).map(|_| Vec::new()).collect(),
+            next: vec![0; n],
+            first,
+            arena: std::ptr::null_mut(),
+            left: 0,
+            region,
+        }
     }
     #[inline(always)]
     fn push(&mut self, b: usize, v: T) {
@@ -1483,24 +1499,47 @@ impl<T: Copy + 'static> Buckets<T> {
                 *p = v;
                 c[0] = p.add(1);
             } else {
-                self.spill.get_unchecked_mut(b).push(v);
+                self.grow(b, v);
             }
         }
     }
-    #[inline(always)]
-    fn main(&self, b: usize) -> &mut [T] {
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self, b: usize, v: T) {
         unsafe {
-            let s = self.base.add(b * self.cap);
-            std::slice::from_raw_parts_mut(s, self.cur[b][0].offset_from(s) as usize)
+            let st = self.start[b];
+            if !st.is_null() {
+                self.full[b].push((st, self.cur[b][0].offset_from(st) as usize));
+            }
+            let cap = if st.is_null() { self.first } else { (self.next[b] as usize).max(self.first / 2).min(1 << 20) };
+            self.next[b] = (cap * 2).min(1 << 20) as u32;
+            if self.left < cap {
+                let m = self.region.max(cap);
+                self.arena = zeroed::<T>(m).as_mut_ptr();
+                self.left = m;
+            }
+            let p = self.arena;
+            self.arena = p.add(cap);
+            self.left -= cap;
+            self.start[b] = p;
+            *p = v;
+            self.cur[b] = [p.add(1), p.add(cap)];
         }
     }
-    #[inline(always)]
-    fn spilled(&self, b: usize) -> &mut [T] {
-        let v = &self.spill[b];
-        unsafe { std::slice::from_raw_parts_mut(v.as_ptr() as *mut T, v.len()) }
+    /// The bucket's records, as a few slices.
+    fn parts(&self, b: usize) -> impl Iterator<Item = &'static mut [T]> + '_ {
+        let cur = unsafe {
+            let st = self.start[b];
+            if st.is_null() {
+                (st, 0)
+            } else {
+                (st, self.cur[b][0].offset_from(st) as usize)
+            }
+        };
+        self.full[b].iter().copied().chain(std::iter::once(cur)).filter(|&(_, n)| n > 0).map(|(p, n)| unsafe { std::slice::from_raw_parts_mut(p, n) })
     }
     fn len(&self, b: usize) -> usize {
-        self.main(b).len() + self.spill[b].len()
+        self.parts(b).map(|p| p.len()).sum()
     }
 }
 
@@ -1844,7 +1883,7 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
     // count (and drop dedup losers in place)
     let mut total = 0usize;
     for o in outs {
-        for part in [o.pe.main(b), o.pe.spilled(b)] {
+        for part in o.pe.parts(b) {
             for r in part.iter_mut() {
                 let t = (r.rowid >> 27) as usize;
                 let i = (r.rowid & ((1 << 27) - 1)) as usize;
@@ -1871,7 +1910,7 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
     w.ev.reserve(total);
     w.ev.set_len(total);
     for o in outs {
-        for part in [o.pe.main(b), o.pe.spilled(b)] {
+        for part in o.pe.parts(b) {
             for r in part.iter() {
                 if r.pid != INVALID {
                     let p = (r.pid - lo_pid) as usize;
@@ -1890,7 +1929,7 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
     w.ccnt.resize(range + 1, 0);
     let mut ctotal = 0usize;
     for o in outs {
-        for part in [o.pc.main(b), o.pc.spilled(b)] {
+        for part in o.pc.parts(b) {
             for c in part.iter() {
                 *w.ccnt.get_unchecked_mut((c.pid - lo_pid) as usize) += 1;
                 ctotal += 1;
@@ -1907,7 +1946,7 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
     w.ck.reserve(ctotal);
     w.ck.set_len(ctotal);
     for o in outs {
-        for part in [o.pc.main(b), o.pc.spilled(b)] {
+        for part in o.pc.parts(b) {
             for c in part.iter() {
                 let p = (c.pid - lo_pid) as usize;
                 let at = *w.ccnt.get_unchecked(p);
@@ -2268,9 +2307,9 @@ fn main() {
         let ctx = Ctx { ws, we, base, products, campaigns, ncat: cat_names.len(), unknown_cat, ncamp, first_day, ndays, ids, pshift };
 
         // ---- phase 1: parse events and clicks
-        let per_eb = est_rows / (nthreads * NEB) * 3 / 2 + 64;
-        let per_pb = est_rows / (nthreads * npb) * 3 / 2 + 256;
-        let per_cb = est_ck / (nthreads * npb) * 3 / 2 + 256;
+        let per_eb = est_rows / (nthreads * NEB);
+        let per_pb = est_rows / (nthreads * npb);
+        let per_cb = est_ck / (nthreads * npb);
         let next = AtomicUsize::new(0);
         let mut outs: Vec<ThreadOut> = Vec::with_capacity(nthreads);
         std::thread::scope(|s| {
@@ -2354,7 +2393,7 @@ fn main() {
                             }
                             used.clear();
                             for o in outs.iter() {
-                                for part in [o.dk.main(b), o.dk.spilled(b)] {
+                                for part in o.dk.parts(b) {
                                     for r in part.iter() {
                                         let v = ((r.ingest as i64 - i32::MIN as i64) as u64) << 32 | r.rowid as u64;
                                         let mut p = (r.ehash as usize) & mask;
