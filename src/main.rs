@@ -1144,9 +1144,59 @@ struct Slot {
     _pad: u32,
 }
 
+/// An ID's bytes: up to 15 inline (bytes 0..15, length in byte 15),
+/// else a ref (ptr | len << 48) in w0 and 0xFF in byte 15.
+#[repr(C, align(16))]
+struct Name {
+    w0: AtomicU64,
+    w1: AtomicU64,
+}
+
+impl Name {
+    /// Stores the ID that `r` (a mkref of padded memory) points at.
+    #[inline(always)]
+    fn set(&self, r: u64) {
+        let n = (r >> 48) as usize;
+        let p = (r & 0xFFFF_FFFF_FFFF) as *const u8;
+        let (a, b) = unsafe {
+            let rd = |i: usize| std::ptr::read_unaligned(p.add(i) as *const u64);
+            if n > 15 {
+                (r, 0xFFu64 << 56)
+            } else if n > 8 {
+                (rd(0), (rd(n - 8) >> (8 * (16 - n))) | ((n as u64) << 56))
+            } else if n == 8 {
+                (rd(0), 8u64 << 56)
+            } else if n == 0 {
+                (0, 0)
+            } else {
+                (rd(0) & (u64::MAX >> (64 - 8 * n)), (n as u64) << 56)
+            }
+        };
+        self.w0.store(a, Relaxed);
+        self.w1.store(b, Relaxed);
+    }
+    #[inline(always)]
+    fn is_long(&self) -> bool {
+        (self.w1.load(Relaxed) >> 56) > 15
+    }
+    #[inline(always)]
+    fn ptr(&self) -> *const u8 {
+        (self.w0.load(Relaxed) & 0xFFFF_FFFF_FFFF) as *const u8
+    }
+    #[inline(always)]
+    fn get(&'static self) -> &'static [u8] {
+        let l = (self.w1.load(Relaxed) >> 56) as usize;
+        if l <= 15 {
+            unsafe { std::slice::from_raw_parts(self as *const Name as *const u8, l) }
+        } else {
+            deref(self.w0.load(Relaxed))
+        }
+    }
+}
+
 struct Ids {
     slots: &'static [Slot],
-    prefs: &'static [AtomicU64], // the ID's bytes (ptr | len << 48)
+    prefs: &'static [Name], // the ID's bytes
     mask: usize,
     bits: u32,
     overflow: AtomicBool,
@@ -1157,7 +1207,7 @@ impl Ids {
         let cap = cap.next_power_of_two().max(1024);
         Ids {
             slots: zeroed::<Slot>(cap),
-            prefs: zeroed::<AtomicU64>(cap),
+            prefs: zeroed::<Name>(cap),
             mask: cap - 1,
             bits: cap.trailing_zeros(),
             overflow: AtomicBool::new(false),
@@ -1181,7 +1231,7 @@ impl Ids {
             if k == 0 {
                 match s.key.compare_exchange(0, h, Relaxed, Relaxed) {
                     Ok(_) => {
-                        unsafe { self.prefs.get_unchecked(i) }.store(r, Relaxed);
+                        unsafe { self.prefs.get_unchecked(i) }.set(r);
                         return (i as u32, true);
                     }
                     Err(k2) => {
@@ -1322,7 +1372,7 @@ fn build_links(ids: &Ids, link_chunks: &[&'static [u8]], nthreads: usize) {
     if ids.overflow.load(Relaxed) {
         return;
     }
-    let name = |i: u32| deref(ids.prefs[i as usize].load(Relaxed));
+    let name = |i: u32| ids.prefs[i as usize].get();
     const PD: usize = 8;
     std::thread::scope(|s| {
         for v in &inserted {
@@ -1336,9 +1386,11 @@ fn build_links(ids: &Ids, link_chunks: &[&'static [u8]], nthreads: usize) {
                         }
                     }
                     if k + PD / 2 < v.len() {
-                        let r = ids.prefs[v[k + PD / 2] as usize].load(Relaxed);
-                        unsafe {
-                            _mm_prefetch((r & 0xFFFF_FFFF_FFFF) as *const i8, _MM_HINT_T0);
+                        let e = &ids.prefs[v[k + PD / 2] as usize];
+                        if e.is_long() {
+                            unsafe {
+                                _mm_prefetch(e.ptr() as *const i8, _MM_HINT_T0);
+                            }
                         }
                     }
                     let r = uf_find(parent, i) as usize;
@@ -1822,8 +1874,10 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
             _mm_prefetch(prefs.as_ptr().add(lo_pid as usize + *w.plist.get_unchecked(ii + 16) as usize) as *const i8, _MM_HINT_T0);
         }
         if ii + 6 < np {
-            let r = prefs.get_unchecked(lo_pid as usize + *w.plist.get_unchecked(ii + 6) as usize).load(Relaxed);
-            _mm_prefetch((r & 0xFFFF_FFFF_FFFF) as *const i8, _MM_HINT_T0);
+            let e = prefs.get_unchecked(lo_pid as usize + *w.plist.get_unchecked(ii + 6) as usize);
+            if e.is_long() {
+                _mm_prefetch(e.ptr() as *const i8, _MM_HINT_T0);
+            }
         }
         let p = *w.plist.get_unchecked(ii) as usize;
         let es = if p == 0 { 0 } else { *w.cnt.get_unchecked(p - 1) as usize };
@@ -1837,7 +1891,7 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
         let evs = w.ev.get_unchecked(es..ee);
         let clicks = w.ck.get_unchecked(cs..ce);
         let nc = clicks.len();
-        let name = deref(prefs.get_unchecked(lo_pid as usize + p).load(Relaxed));
+        let name = prefs.get_unchecked(lo_pid as usize + p).get();
         put_str(&mut ud.names, name);
         ud.nnames += 1;
         let n = evs.len();
@@ -2472,6 +2526,24 @@ mod tests {
         }
         v
     }
+    #[test]
+    fn name_roundtrip() {
+        let mut buf = vec![0u8; 256];
+        for (i, b) in buf.iter_mut().enumerate() {
+            *b = b'a' + (i % 26) as u8;
+        }
+        let buf: &'static [u8] = Box::leak(buf.into_boxed_slice());
+        let names: &'static [Name] = zeroed::<Name>(64);
+        for n in 1..=48usize {
+            for off in 0..8 {
+                let e = &names[n];
+                e.set(mkref(unsafe { buf.as_ptr().add(off) }, n));
+                assert_eq!(e.get(), &buf[off..off + n], "n={n} off={off}");
+                assert_eq!(e.is_long(), n > 15);
+            }
+        }
+    }
+
     #[test]
     fn fuzz_canonical() {
         let mut r = Rng(12345);
