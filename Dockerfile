@@ -1,6 +1,6 @@
 # Shopping Sessions: a native Rust pipeline (no dependencies beyond std).
 # The scorer builds this natively on linux/amd64; build time is not timed.
-FROM rust:1.86-slim-bookworm AS build
+FROM rust:1.97.0-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
