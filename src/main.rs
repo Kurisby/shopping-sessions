@@ -2754,6 +2754,9 @@ fn main() {
                     s.spawn(move || {
                         let mut tab: Vec<[u64; 2]> = Vec::new(); // (ehash, ingest << 32 | pref)
                         let mut used: Vec<u32> = Vec::new();
+                        let mut filt: Vec<u64> = Vec::new();
+                        let mut multi: Vec<u64> = Vec::new();
+                        let mut cands: Vec<DKey> = Vec::new();
                         // each PRec has one DKey, so no two threads write the same record
                         let mark = |pref: u32| {
                             if pref != NONE {
@@ -2769,39 +2772,82 @@ fn main() {
                                 break;
                             }
                             let total: usize = outs.iter().map(|o| o.dk.len(b)).sum();
-                            let cap = (total * 2).next_power_of_two().max(16);
+                            if total == 0 {
+                                continue;
+                            }
+                            // two filter passes (no data-dependent branches) keep only the keys whose
+                            // filter bit another key also set: every copy of a duplicated event, plus
+                            // a few percent of false hits. Only those go through the hash table.
+                            let fb = (total * 16).next_power_of_two().max(1024);
+                            let fmask = (fb - 1) as u64;
+                            filt.clear();
+                            filt.resize(fb / 64, 0);
+                            multi.clear();
+                            multi.resize(fb / 64, 0);
+                            let fp = filt.as_mut_ptr();
+                            let mp = multi.as_mut_ptr();
+                            for o in outs.iter() {
+                                for part in o.dk.parts(b) {
+                                    for r in part.iter() {
+                                        let i = r.ehash & fmask;
+                                        let w = (i >> 6) as usize;
+                                        let bit = 1u64 << (i & 63);
+                                        unsafe {
+                                            let f = *fp.add(w);
+                                            *mp.add(w) |= f & bit;
+                                            *fp.add(w) = f | bit;
+                                        }
+                                    }
+                                }
+                            }
+                            cands.clear();
+                            cands.reserve(total);
+                            let cp = cands.as_mut_ptr();
+                            let mut nc = 0usize;
+                            for o in outs.iter() {
+                                for part in o.dk.parts(b) {
+                                    for r in part.iter() {
+                                        let i = r.ehash & fmask;
+                                        unsafe {
+                                            let hit = (*mp.add((i >> 6) as usize) >> (i & 63)) & 1;
+                                            *cp.add(nc) = *r;
+                                            nc += hit as usize;
+                                        }
+                                    }
+                                }
+                            }
+                            unsafe {
+                                cands.set_len(nc);
+                            }
+                            let cap = (nc * 2).next_power_of_two().max(16);
                             let mask = cap - 1;
                             if tab.len() < cap {
                                 // grow (fresh zeroed memory); otherwise reuse: only used slots are dirty
                                 tab = vec![[0; 2]; cap];
                             }
                             used.clear();
-                            for o in outs.iter() {
-                                for part in o.dk.parts(b) {
-                                    for r in part.iter() {
-                                        let v = ((r.ingest as i64 - i32::MIN as i64) as u64) << 32 | r.pref as u64;
-                                        let mut p = (r.ehash as usize) & mask;
-                                        loop {
-                                            let e = unsafe { tab.get_unchecked_mut(p) };
-                                            let k = e[0];
-                                            if k == 0 {
-                                                *e = [r.ehash, v];
-                                                used.push(p as u32);
-                                                break;
-                                            }
-                                            if k == r.ehash {
-                                                let old = e[1];
-                                                if (v >> 32) < (old >> 32) {
-                                                    e[1] = v;
-                                                    mark(old as u32);
-                                                } else {
-                                                    mark(v as u32);
-                                                }
-                                                break;
-                                            }
-                                            p = (p + 1) & mask;
-                                        }
+                            for r in cands.iter() {
+                                let v = ((r.ingest as i64 - i32::MIN as i64) as u64) << 32 | r.pref as u64;
+                                let mut p = (r.ehash as usize) & mask;
+                                loop {
+                                    let e = unsafe { tab.get_unchecked_mut(p) };
+                                    let k = e[0];
+                                    if k == 0 {
+                                        *e = [r.ehash, v];
+                                        used.push(p as u32);
+                                        break;
                                     }
+                                    if k == r.ehash {
+                                        let old = e[1];
+                                        if (v >> 32) < (old >> 32) {
+                                            e[1] = v;
+                                            mark(old as u32);
+                                        } else {
+                                            mark(v as u32);
+                                        }
+                                        break;
+                                    }
+                                    p = (p + 1) & mask;
                                 }
                             }
                             for &p in used.iter() {
