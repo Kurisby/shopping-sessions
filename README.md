@@ -11,3 +11,5 @@ A single-binary Rust implementation (standard library only, no crates) of the Sh
 Build and run like the starter: `docker build -t shopping-sessions .`, then run with `/data`, `/output` and `/scratch` mounted. Outside Docker: `cargo build --release && target/release/pipeline DATA_DIR OUTPUT_DIR`.
 
 Passes all 36 fixtures and matches the published dev answer exactly.
+
+Build b47r is b47 with this note only: the same code, under a second commit for a repeat run.
