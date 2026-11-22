@@ -146,6 +146,22 @@ fn release_regions(nthreads: usize) {
     });
 }
 
+const MADV_POPULATE_READ: i32 = 22;
+
+/// Maps a chunk's file pages in one call instead of a page fault every 64 KB (fault-around):
+/// far less kernel time per page. Harmless no-op on kernels without MADV_POPULATE_READ.
+fn populate(chunk: &[u8]) {
+    if chunk.is_empty() || NO_POP.load(Relaxed) {
+        return;
+    }
+    let s = (chunk.as_ptr() as usize) & !4095;
+    let e = chunk.as_ptr() as usize + chunk.len();
+    unsafe {
+        madvise(s as *mut u8, e - s, MADV_POPULATE_READ);
+    }
+}
+static NO_POP: AtomicBool = AtomicBool::new(false);
+
 /// Maps a file read-only with at least one zero page after it, so SIMD loads may run past the end.
 fn map_file(path: &Path) -> &'static [u8] {
     let f = File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
@@ -1420,6 +1436,7 @@ fn build_links(ids: &Ids, link_chunks: &[&'static [u8]], nthreads: usize) {
                             break;
                         }
                         unsafe {
+                            populate(link_chunks[j]);
                             for_lines::<2>(&mut flat, link_chunks[j], |fp, fl| {
                                 if fl[0] == 0 || fl[1] == 0 {
                                     return;
@@ -2190,6 +2207,9 @@ fn main() {
     if std::env::var("SS_NOTHP").is_ok() {
         NO_THP.store(true, Relaxed);
     }
+    if std::env::var("SS_NOPOP").is_ok() {
+        NO_POP.store(true, Relaxed);
+    }
     let verbose = std::env::var("SS_VERBOSE").is_ok();
     let lap = |what: &str| {
         if verbose {
@@ -2379,6 +2399,7 @@ fn main() {
                             break;
                         }
                         let (kind, chunk) = jobs[j];
+                        populate(chunk);
                         unsafe {
                             if kind == 0 {
                                 parse_events(ctx, chunk, &mut out);
