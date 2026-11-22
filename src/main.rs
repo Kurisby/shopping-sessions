@@ -837,8 +837,11 @@ impl Flat {
 unsafe fn for_lines<const N: usize>(flat: &mut Flat, chunk: &'static [u8], mut f: impl FnMut(&[*const u8; N], &[usize; N])) {
     let cs = chunk.as_ptr();
     let clen = chunk.len();
-    let mut fp: [*const u8; N] = [std::ptr::null(); N];
-    let mut fl: [usize; N] = [0; N];
+    // 8 slots (the vector path writes 8 lanes); callers see the first N
+    let mut fpa: [*const u8; 8] = [std::ptr::null(); 8];
+    let mut fla: [usize; 8] = [0; 8];
+    let fp: &mut [*const u8; N] = &mut *(fpa.as_mut_ptr() as *mut [*const u8; N]);
+    let fl: &mut [usize; N] = &mut *(fla.as_mut_ptr() as *mut [usize; N]);
     let mut rs = 0usize;
     while rs < clen {
         let mut re = rs + REGION;
@@ -885,12 +888,31 @@ unsafe fn for_lines<const N: usize>(flat: &mut Flat, chunk: &'static [u8], mut f
                 qls = flat.qbefore(ls);
                 continue;
             }
-            fp[0] = base.add(ls as usize);
-            fl[0] = (*s - ls) as usize;
-            for i in 1..N {
-                let a = *s.add(i - 1) + 1;
-                fp[i] = base.add(a as usize);
-                fl[i] = (*s.add(i) - a) as usize;
+            if N == 7 || N == 4 {
+                // starts = [ls, s0 + 1, s1 + 1, ...], lens = s - starts, in 8 lanes at once
+                let sv = _mm256_loadu_si256(s as *const __m256i);
+                let prev = _mm256_permutevar8x32_epi32(sv, _mm256_setr_epi32(0, 0, 1, 2, 3, 4, 5, 6));
+                let prev = _mm256_blend_epi32::<1>(prev, _mm256_set1_epi32(ls as i32 - 1));
+                let starts = _mm256_sub_epi32(prev, _mm256_set1_epi32(-1));
+                let lens = _mm256_sub_epi32(sv, starts);
+                let bv = _mm256_set1_epi64x(base as i64);
+                let fpp = fp.as_mut_ptr() as *mut __m256i;
+                let flp = fl.as_mut_ptr() as *mut __m256i;
+                _mm256_storeu_si256(fpp, _mm256_add_epi64(bv, _mm256_cvtepu32_epi64(_mm256_castsi256_si128(starts))));
+                _mm256_storeu_si256(flp, _mm256_cvtepu32_epi64(_mm256_castsi256_si128(lens)));
+                if N == 7 {
+                    // lanes 4..7 (the 8th is scratch, written into fp/fl's padding)
+                    _mm256_storeu_si256(fpp.add(1), _mm256_add_epi64(bv, _mm256_cvtepu32_epi64(_mm256_extracti128_si256::<1>(starts))));
+                    _mm256_storeu_si256(flp.add(1), _mm256_cvtepu32_epi64(_mm256_extracti128_si256::<1>(lens)));
+                }
+            } else {
+                fp[0] = base.add(ls as usize);
+                fl[0] = (*s - ls) as usize;
+                for i in 1..N {
+                    let a = *s.add(i - 1) + 1;
+                    fp[i] = base.add(a as usize);
+                    fl[i] = (*s.add(i) - a) as usize;
+                }
             }
             // the line's '\n' is no quote, so quotes before the next line = quotes before `last`
             let ql = flat.qbefore(last);
@@ -914,7 +936,7 @@ unsafe fn for_lines<const N: usize>(flat: &mut Flat, chunk: &'static [u8], mut f
                     continue;
                 }
             }
-            f(&fp, &fl);
+            f(fp, fl);
         }
         rs = re;
     }
@@ -929,6 +951,7 @@ unsafe fn sl(p: *const u8, n: usize) -> &'static [u8] {
 
 struct Lookup {
     prefix: Vec<u8>,
+    pword: u64, // prefix bytes, little-endian
     direct: Vec<u32>,
     other: U64Map<u32>,
     has_other: bool,
@@ -938,7 +961,31 @@ const ABSENT: u32 = u32::MAX;
 
 impl Lookup {
     fn new(prefix: &[u8]) -> Self {
-        Lookup { prefix: prefix.to_vec(), direct: Vec::new(), other: U64Map::with_capacity(16), has_other: false }
+        let mut pw = [0u8; 8];
+        pw[..prefix.len().min(8)].copy_from_slice(&prefix[..prefix.len().min(8)]);
+        Lookup { prefix: prefix.to_vec(), pword: u64::from_le_bytes(pw), direct: Vec::new(), other: U64Map::with_capacity(16), has_other: false }
+    }
+    /// `canonical` for keys inside padded memory (8 readable bytes past the key's start
+    /// and past the prefix): word compares instead of byte loops.
+    #[inline(always)]
+    unsafe fn canonical_fast(&self, k: &[u8]) -> Option<usize> {
+        let p = self.prefix.len();
+        let n = k.len().wrapping_sub(p); // digits
+        if n.wrapping_sub(1) >= 8 || p > 8 {
+            return self.canonical(k);
+        }
+        let w = std::ptr::read_unaligned(k.as_ptr() as *const u64);
+        let pm = u64::MAX >> (64 - 8 * p as u32);
+        if (w & pm) != self.pword {
+            return None;
+        }
+        let v = std::ptr::read_unaligned(k.as_ptr().add(p) as *const u64);
+        // digits into the high bytes, '0's below (leading zeros)
+        let x = (v << (8 * (8 - n) as u32)) | 0x3030303030303030u64.checked_shr(8 * n as u32).unwrap_or(0);
+        if !all_digits(x) || ((v & 0xFF) == b'0' as u64 && n > 1) {
+            return None;
+        }
+        Some(parse8(x) as usize)
     }
     #[inline(always)]
     fn canonical(&self, k: &[u8]) -> Option<usize> {
@@ -976,8 +1023,9 @@ impl Lookup {
         }
     }
     #[inline(always)]
+    /// `k` must lie in padded memory (mapped input files are).
     fn get(&self, k: &[u8]) -> u32 {
-        if let Some(x) = self.canonical(k) {
+        if let Some(x) = unsafe { self.canonical_fast(k) } {
             return if x < self.direct.len() { self.direct[x] } else { ABSENT };
         }
         if self.has_other {
@@ -2340,6 +2388,31 @@ mod tests {
             }
         }
         v
+    }
+    #[test]
+    fn fuzz_canonical() {
+        let mut r = Rng(12345);
+        let mut buf = vec![0u8; 64];
+        for pre in [&b"p"[..], &b"c_"[..]] {
+            let l = Lookup::new(pre);
+            for _ in 0..5_000_000 {
+                let n = r.below(14) as usize;
+                let alphabet = b"0123456789pc_ x";
+                for i in 0..n {
+                    buf[i] = if r.below(4) == 0 { alphabet[r.below(alphabet.len() as u64) as usize] } else { b'0' + r.below(10) as u8 };
+                }
+                if r.below(2) == 0 && n >= pre.len() {
+                    buf[..pre.len()].copy_from_slice(pre);
+                }
+                for k in n..64 {
+                    buf[k] = (r.next() & 0xFF) as u8;
+                }
+                let k = &buf[..n];
+                let want = l.canonical(k);
+                let got = unsafe { l.canonical_fast(k) };
+                assert_eq!(got, want, "key {:?}", String::from_utf8_lossy(k));
+            }
+        }
     }
     #[test]
     fn fuzz_ts() {
