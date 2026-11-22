@@ -2184,6 +2184,121 @@ fn env_or(k: &str, d: &str) -> String {
     std::env::var(k).unwrap_or_else(|_| d.to_string())
 }
 
+static DIAG: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+
+/// Diagnostic microbenchmarks of the machine (this build fails on purpose after running).
+fn diag_bench(nthreads: usize) -> String {
+    const REG: usize = 256 << 20;
+    let mut out = String::new();
+    // 1. page faults + zeroing of fresh huge-page memory, all threads
+    let t = Instant::now();
+    let regs: Vec<usize> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..nthreads)
+            .map(|_| {
+                s.spawn(|| unsafe {
+                    let p = mmap(std::ptr::null_mut(), REG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+                    madvise(p, REG, MADV_HUGEPAGE);
+                    let mut o = 0;
+                    while o < REG {
+                        *p.add(o) = 1;
+                        o += 4096;
+                    }
+                    p as usize
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let dt = t.elapsed().as_secs_f64();
+    out.push_str(&format!("fault={:.2}GB/s({:.0}ms) ", (nthreads * REG) as f64 / dt / 1e9, dt * 1e3));
+    // 2. streaming read of the same memory
+    let t = Instant::now();
+    let sum: u64 = std::thread::scope(|s| {
+        let hs: Vec<_> = regs.iter().map(|&p| s.spawn(move || unsafe {
+            let v = std::slice::from_raw_parts(p as *const u64, REG / 8);
+            let mut a = 0u64;
+            for c in v.chunks_exact(8) {
+                a = a.wrapping_add(c[0] ^ c[3] ^ c[7]);
+            }
+            a
+        })).collect();
+        hs.into_iter().map(|h| h.join().unwrap()).fold(0, |a, b| a ^ b)
+    });
+    let dt = t.elapsed().as_secs_f64();
+    out.push_str(&format!("stream={:.1}GB/s ", (nthreads * REG) as f64 / dt / 1e9));
+    // 3. random 64-byte reads with 16-deep software prefetch, in a table of each size
+    for &mb in &[8usize, 32, 128, 256] {
+        let bytes = mb << 20;
+        let per = 2_000_000usize;
+        let t = Instant::now();
+        let r: u64 = std::thread::scope(|s| {
+            let hs: Vec<_> = (0..nthreads).map(|k| { let base = regs[0]; s.spawn(move || unsafe {
+                let lines = bytes / 64;
+                let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ k as u64;
+                let mut idx = [0usize; 16];
+                for i in 0..16 { x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); idx[i] = ((x >> 20) as usize % lines) * 64; }
+                let mut a = 0u64;
+                for i in 0..per {
+                    let j = idx[i & 15];
+                    a = a.wrapping_add(*((base + j) as *const u64));
+                    x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                    let n = ((x >> 20) as usize % lines) * 64;
+                    _mm_prefetch((base + n) as *const i8, _MM_HINT_T0);
+                    idx[i & 15] = n;
+                }
+                a
+            })}).collect();
+            hs.into_iter().map(|h| h.join().unwrap()).fold(0, |a, b| a ^ b)
+        });
+        let dt = t.elapsed().as_secs_f64();
+        out.push_str(&format!("rand{mb}M={:.1}ns ", dt * 1e9 / per as f64 / nthreads as f64 * nthreads as f64 / nthreads as f64));
+        let _ = r;
+    }
+    // 4. one thread: dependent random loads in 128 MB (latency)
+    let t = Instant::now();
+    let lat = unsafe {
+        let base = regs[0];
+        let lines = (128usize << 20) / 64;
+        let mut x = 12345u64;
+        let mut j = 0usize;
+        let mut a = 0u64;
+        for _ in 0..200_000 {
+            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let v = *((base + j) as *const u64);
+            a = a.wrapping_add(v);
+            j = ((((x >> 20) ^ (v & 1)) as usize) % lines) * 64;
+        }
+        a
+    };
+    out.push_str(&format!("lat128M={:.0}ns ", t.elapsed().as_secs_f64() * 1e9 / 200_000.0));
+    for &p in &regs {
+        unsafe { munmap(p as *mut u8, REG) };
+    }
+    out.push_str(&format!("x={}", (sum ^ lat) & 1));
+    out
+}
+
+fn diag_sysinfo() -> String {
+    let rd = |p: &str| fs::read_to_string(p).unwrap_or_default().trim().replace('\n', ";");
+    let cpu = fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    let model = cpu.lines().find(|l| l.starts_with("model name")).unwrap_or("").split(':').nth(1).unwrap_or("").trim().to_string();
+    let mhz = cpu.lines().find(|l| l.starts_with("cpu MHz")).unwrap_or("").split(':').nth(1).unwrap_or("").trim().to_string();
+    let nproc = cpu.lines().filter(|l| l.starts_with("processor")).count();
+    let flags = cpu.lines().find(|l| l.starts_with("flags")).unwrap_or("");
+    let vbmi2 = flags.contains("avx512_vbmi2");
+    format!(
+        "cpu=[{model}] mhz={mhz} nproc={nproc} vbmi2={vbmi2} l3={} l2={} sib0={} thp={} defrag={} cpumax={} kernel={}",
+        rd("/sys/devices/system/cpu/cpu0/cache/index3/size"),
+        rd("/sys/devices/system/cpu/cpu0/cache/index2/size"),
+        rd("/sys/devices/system/cpu/cpu0/topology/thread_siblings_list"),
+        rd("/sys/kernel/mm/transparent_hugepage/enabled"),
+        rd("/sys/kernel/mm/transparent_hugepage/defrag"),
+        rd("/sys/fs/cgroup/cpu.max"),
+        rd("/proc/sys/kernel/osrelease"),
+    )
+}
+
 fn main() {
     let t0 = Instant::now();
     init_month_tables();
@@ -2195,6 +2310,10 @@ fn main() {
         if verbose {
             eprintln!("{what:>12} {:8.1} ms", t0.elapsed().as_secs_f64() * 1000.0);
         }
+        // diagnostic build: wall ms, and process user/sys ticks, at each phase end
+        let st = fs::read_to_string("/proc/self/stat").unwrap_or_default();
+        let f: Vec<&str> = st.rsplit(')').next().unwrap_or("").split_whitespace().collect();
+        DIAG.lock().unwrap().push_str(&format!("{what}={:.0}/u{}/s{}/f{} ", t0.elapsed().as_secs_f64() * 1000.0, f.get(11).unwrap_or(&"?"), f.get(12).unwrap_or(&"?"), f.get(7).unwrap_or(&"?")));
     };
     let args: Vec<String> = std::env::args().collect();
     let (data_dir, out_dir) = if args.len() >= 3 {
@@ -2638,7 +2757,12 @@ fn main() {
             release_regions(nthreads);
             lap("released");
         }
-        std::process::exit(0);
+        // diagnostic build: report phase timings and the machine, then fail on purpose
+        let b = diag_bench(nthreads);
+        let msg = format!("DIAG {} | t={} | {} | {}", DIAG.lock().unwrap(), nthreads, b, diag_sysinfo());
+        eprintln!("{msg}");
+        println!("{msg}");
+        std::process::exit(3);
     }
 }
 
