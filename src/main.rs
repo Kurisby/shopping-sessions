@@ -289,7 +289,7 @@ unsafe fn hash_ptr(p: *const u8, n: usize) -> u64 {
     let x1 = _mm_and_si128(_mm_loadu_si128(p.add(16) as *const __m128i), _mm_loadu_si128(m.add(16) as *const __m128i));
     let x2 = _mm_and_si128(_mm_loadu_si128(p.add(32) as *const __m128i), _mm_loadu_si128(m.add(32) as *const __m128i));
     let s = _mm_aesenc_si128(_mm_aesenc_si128(_mm_xor_si128(x0, k0), x1), x2);
-    let s = _mm_aesenc_si128(_mm_aesenc_si128(s, _mm_cvtsi64_si128(n as i64)), k0);
+    let s = _mm_aesenc_si128(_mm_aesenc_si128(s, _mm_set1_epi64x(n as i64)), k0);
     let h = _mm_cvtsi128_si64(s) as u64;
     if h == 0 {
         1
@@ -551,6 +551,9 @@ static mut MONTH_START: [i32; 4800] = [0; 4800]; // days since epoch of the 1st,
 static mut MONTH_LEN: [u8; 4800] = [0; 4800];
 /// (year - 1900) * 16 + month -> days-since-epoch of the 1st << 8 | month length
 static mut TBL16: [i32; 6400] = [0; 6400];
+/// (year - 2000) * 512 + month * 32 + day -> seconds since the epoch of that day's start,
+/// years 2000..2063; 0 for anything that is not a date.
+static mut DAYSECS: [u32; 32768] = [0; 32768];
 
 fn init_month_tables() {
     unsafe {
@@ -570,6 +573,11 @@ fn init_month_tables() {
                     _ => 31,
                 };
                 TBL16[((y - 1900) * 16 + m) as usize] = (MONTH_START[i] << 8) | MONTH_LEN[i] as i32;
+                if (2000..2064).contains(&y) {
+                    for d in 1..=MONTH_LEN[i] as i64 {
+                        DAYSECS[((y - 2000) * 512 + m * 32 + d) as usize] = ((MONTH_START[i] as i64 + d - 1) * 86_400) as u32;
+                    }
+                }
             }
         }
     }
@@ -666,9 +674,11 @@ const fn w128(w: [i16; 8]) -> __m128i {
     unsafe { std::mem::transmute(w) }
 }
 
-/// SIMD form of `parse_f12`: same results. F2 reads 3 bytes past its end (padded memory only).
+/// Whole seconds of `YYYY-MM-DDTHH:MM:SS` + `Z` (or + any byte when F2) at `p`, years
+/// 2000..2063 only; u64::MAX when it is anything else (the caller then parses it exactly).
+/// One branch covers the format and the field ranges; the day table rejects bad dates.
 #[inline(always)]
-unsafe fn parse_f12_simd<const F2: bool>(p: *const u8) -> i64 {
+unsafe fn iso_secs<const F2: bool>(p: *const u8) -> u64 {
     const PA: __m128i = v128(*b"0000-00-00T00:00");
     const LA: __m128i = v128([9, 9, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9]);
     const PB1: __m128i = v128(*b"-00-00T00:00:00Z");
@@ -678,34 +688,41 @@ unsafe fn parse_f12_simd<const F2: bool>(p: *const u8) -> i64 {
     const SHA: __m128i = v128([0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 0x80, 0x80, 0x80, 0x80]);
     const SHB: __m128i = v128([0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 13, 14, 0x80, 0x80]);
     const W10: __m128i = v128([10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1]);
-    const LO: __m128i = w128([19, 0, 1, 1, 0, 0, 0, 0]);
-    const HI: __m128i = w128([22, 99, 12, 31, 23, 59, 59, 0]);
-    const WM: __m128i = w128([1600, 16, 1, 0, 3600, 60, 1, 0]);
+    // [YY, YY, MM, DD, hh, mm, ss, 0]: century 20, and every field small enough for the table
+    const LO: __m128i = w128([20, 0, 0, 0, 0, 0, 0, 0]);
+    const HI: __m128i = w128([20, 63, 15, 31, 23, 59, 59, 0]);
+    const WM: __m128i = w128([0, 512, 32, 1, 3600, 60, 1, 0]);
     let a = _mm_loadu_si128(p as *const __m128i);
     let b = _mm_loadu_si128(p.add(4) as *const __m128i);
     let xa = _mm_xor_si128(a, PA);
     let xb = _mm_xor_si128(b, if F2 { PB2 } else { PB1 });
     let lb = if F2 { LB2 } else { LB1 };
     let ok = _mm_and_si128(_mm_cmpeq_epi8(_mm_max_epu8(xa, LA), LA), _mm_cmpeq_epi8(_mm_max_epu8(xb, lb), lb));
-    if _mm_movemask_epi8(ok) != 0xFFFF {
-        return BAD_TS;
-    }
     let v = _mm_or_si128(_mm_shuffle_epi8(xa, SHA), _mm_shuffle_epi8(xb, SHB));
-    let vals = _mm_maddubs_epi16(v, W10); // [YY, YY, MM, DD, hh, mm, ss, 0]
+    let vals = _mm_maddubs_epi16(v, W10);
     let bad = _mm_or_si128(_mm_cmpgt_epi16(LO, vals), _mm_cmpgt_epi16(vals, HI));
-    if _mm_movemask_epi8(bad) != 0 {
-        // out-of-table year (exact slow path) or a bad field
-        return parse_iso(sl(p, if F2 { 25 } else { 20 })).unwrap_or(BAD_TS);
+    if _mm_movemask_epi8(_mm_andnot_si128(bad, ok)) != 0xFFFF {
+        return u64::MAX;
     }
-    let r = _mm_madd_epi16(vals, WM); // [ym16, month, hh*3600 + mm*60, ss]
-    let ym = _mm_cvtsi128_si32(r) + _mm_extract_epi32::<1>(r) - 1900 * 16;
-    let hms = _mm_extract_epi32::<2>(r) + _mm_extract_epi32::<3>(r);
-    let d = _mm_extract_epi16::<3>(vals);
-    let packed = *TBL16.get_unchecked(ym as usize);
-    if (d - 1) as u32 >= (packed & 0xFF) as u32 {
-        return BAD_TS;
+    let r = _mm_madd_epi16(vals, WM); // [year * 512, month * 32 + day, hh * 3600 + mm * 60, ss]
+    let q = _mm_add_epi32(r, _mm_srli_epi64::<32>(r)); // [table index, _, seconds of day, _]
+    let t = *DAYSECS.get_unchecked(_mm_cvtsi128_si32(q) as u32 as usize);
+    if t == 0 {
+        return u64::MAX;
     }
-    let ms = (((packed >> 8) + d - 1) as i64 * 86_400 + hms as i64) * 1000;
+    t as u64 + _mm_extract_epi32::<2>(q) as u32 as u64
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ` (n == 20) or, F2, `YYYY-MM-DDTHH:MM:SS+HH:MM` (n == 25) in ms;
+/// BAD_TS when not valid. F2 reads 3 bytes past its end (padded memory only).
+#[inline(always)]
+unsafe fn parse_f12_simd<const F2: bool>(p: *const u8) -> i64 {
+    let secs = iso_secs::<F2>(p);
+    if secs == u64::MAX {
+        // anything else of this length: the exact parser (other years, bad fields, digits)
+        return parse_ts_cold(p, if F2 { 25 } else { 20 });
+    }
+    let ms = secs as i64 * 1000;
     if !F2 {
         return ms;
     }
@@ -732,43 +749,19 @@ unsafe fn parse_f12_simd<const F2: bool>(p: *const u8) -> i64 {
 /// sub-second part, so this is exactly its value / 1000.
 #[inline(always)]
 unsafe fn parse_z_secs(p: *const u8) -> i64 {
-    const PA: __m128i = v128(*b"0000-00-00T00:00");
-    const LA: __m128i = v128([9, 9, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9]);
-    const PB1: __m128i = v128(*b"-00-00T00:00:00Z");
-    const LB1: __m128i = v128([0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0, 9, 9, 0]);
-    const SHA: __m128i = v128([0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 0x80, 0x80, 0x80, 0x80]);
-    const SHB: __m128i = v128([0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 13, 14, 0x80, 0x80]);
-    const W10: __m128i = v128([10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1, 10, 1]);
-    const LO: __m128i = w128([19, 0, 1, 1, 0, 0, 0, 0]);
-    const HI: __m128i = w128([22, 99, 12, 31, 23, 59, 59, 0]);
-    const WM: __m128i = w128([1600, 16, 1, 0, 3600, 60, 1, 0]);
-    let a = _mm_loadu_si128(p as *const __m128i);
-    let b = _mm_loadu_si128(p.add(4) as *const __m128i);
-    let xa = _mm_xor_si128(a, PA);
-    let xb = _mm_xor_si128(b, PB1);
-    let ok = _mm_and_si128(_mm_cmpeq_epi8(_mm_max_epu8(xa, LA), LA), _mm_cmpeq_epi8(_mm_max_epu8(xb, LB1), LB1));
-    if _mm_movemask_epi8(ok) != 0xFFFF {
-        return BAD_TS;
+    let secs = iso_secs::<false>(p);
+    if secs == u64::MAX {
+        let ms = parse_ts_cold(p, 20);
+        return if ms == BAD_TS { BAD_TS } else { ms.div_euclid(1000) };
     }
-    let v = _mm_or_si128(_mm_shuffle_epi8(xa, SHA), _mm_shuffle_epi8(xb, SHB));
-    let vals = _mm_maddubs_epi16(v, W10); // [YY, YY, MM, DD, hh, mm, ss, 0]
-    let bad = _mm_or_si128(_mm_cmpgt_epi16(LO, vals), _mm_cmpgt_epi16(vals, HI));
-    if _mm_movemask_epi8(bad) != 0 {
-        // out-of-table year (exact slow path) or a bad field
-        return match parse_iso(sl(p, 20)) {
-            Some(ms) => ms.div_euclid(1000),
-            None => BAD_TS,
-        };
-    }
-    let r = _mm_madd_epi16(vals, WM); // [ym16, month, hh*3600 + mm*60, ss]
-    let ym = _mm_cvtsi128_si32(r) + _mm_extract_epi32::<1>(r) - 1900 * 16;
-    let hms = _mm_extract_epi32::<2>(r) + _mm_extract_epi32::<3>(r);
-    let d = _mm_extract_epi16::<3>(vals);
-    let packed = *TBL16.get_unchecked(ym as usize);
-    if (d - 1) as u32 >= (packed & 0xFF) as u32 {
-        return BAD_TS;
-    }
-    ((packed >> 8) + d - 1) as i64 * 86_400 + hms as i64
+    secs as i64
+}
+
+/// `parse_ts` of `n` bytes at `p`, BAD_TS when bad: the rare inputs the fast paths decline.
+#[cold]
+#[inline(never)]
+unsafe fn parse_ts_cold(p: *const u8, n: usize) -> i64 {
+    parse_ts(sl(p, n)).unwrap_or(BAD_TS)
 }
 
 /// Any timestamp form; BAD_TS when bad.
@@ -2942,11 +2935,30 @@ mod tests {
             for k in v.len()..64 {
                 buf[k] = (r.next() & 0xFF) as u8;
             }
+            let mut v = v;
+            if it % 7 == 3 {
+                // digit strings and stray bytes of the ISO lengths
+                let k = (r.next() % v.len() as u64) as usize;
+                v[k] = if r.below(2) == 0 { b'0' + r.below(10) as u8 } else { (r.next() & 0xFF) as u8 };
+                if r.below(3) == 0 {
+                    let z = r.below(v.len() as u64) as usize;
+                    for (i, b) in v.iter_mut().enumerate() {
+                        *b = if i < z { b'0' } else { b'0' + r.below(10) as u8 };
+                    }
+                }
+                buf[..v.len()].copy_from_slice(&v);
+            }
             let want = parse_ts(&v).unwrap_or(BAD_TS);
             let got = unsafe { parse_ts_fast(buf.as_ptr(), v.len()) };
             let old = unsafe { if v.len() == 20 { parse_f12::<false>(buf.as_ptr()) } else { parse_f12::<true>(buf.as_ptr()) } };
             assert_eq!(got, want, "input {:?}", String::from_utf8_lossy(&v));
-            assert_eq!(old, want, "old input {:?}", String::from_utf8_lossy(&v));
+            if v[4] == b'-' {
+                assert_eq!(old, want, "old input {:?}", String::from_utf8_lossy(&v));
+            }
+            if v.len() == 20 {
+                let zs = unsafe { parse_z_secs(buf.as_ptr()) };
+                assert_eq!(zs, if want == BAD_TS { BAD_TS } else { want.div_euclid(1000) }, "z input {:?}", String::from_utf8_lossy(&v));
+            }
             valid += (want != BAD_TS) as u64;
         }
         eprintln!("valid {valid}");
