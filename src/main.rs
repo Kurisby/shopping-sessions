@@ -1473,7 +1473,7 @@ struct Ctx {
 const EB_BITS: u32 = 9;
 const NEB: usize = 1 << EB_BITS;
 const NPB: usize = 512;
-const RING: usize = 16;
+const BATCH: usize = 64;
 const INVALID: u32 = u32::MAX;
 
 #[inline(always)]
@@ -1496,32 +1496,32 @@ struct ThreadOut {
     pc: Buckets<CRec>,
     rows: u32,
     tid: u32,
-    ring: [Pending; RING],
-    rn: usize,
-    rh: usize,
+    batch: [Pending; BATCH],
+    bn: usize,
     flat: Flat,
 }
 
 impl ThreadOut {
-    #[inline(always)]
-    fn pop_event(&mut self, ctx: &Ctx) {
-        let e = self.ring[self.rh];
-        self.rh = (self.rh + 1) % RING;
-        self.rn -= 1;
-        let pid = ctx.ids.person(e.uhash, e.uref);
-        self.pe.push((pid >> ctx.pshift) as usize, PRec { pid, ts: e.a, pc: e.b, rowid: e.c });
+    #[inline(never)]
+    fn flush_events(&mut self, ctx: &Ctx) {
+        let n = self.bn;
+        self.bn = 0;
+        for i in 0..n {
+            let e = unsafe { *self.batch.get_unchecked(i) };
+            let pid = ctx.ids.person(e.uhash, e.uref);
+            self.pe.push((pid >> ctx.pshift) as usize, PRec { pid, ts: e.a, pc: e.b, rowid: e.c });
+        }
     }
     #[inline(always)]
     fn push_pending(&mut self, p: Pending, ctx: &Ctx) {
         unsafe {
             _mm_prefetch(ctx.ids.slot_ptr(p.uhash) as *const i8, _MM_HINT_T0);
+            *self.batch.get_unchecked_mut(self.bn) = p;
         }
-        if self.rn == RING {
-            self.pop_event(ctx);
+        self.bn += 1;
+        if self.bn == BATCH {
+            self.flush_events(ctx);
         }
-        let tail = (self.rh + self.rn) % RING;
-        self.ring[tail] = p;
-        self.rn += 1;
     }
 }
 
@@ -1534,32 +1534,32 @@ struct PendingClick {
     camp: u32,
 }
 
-struct ClickRing {
-    ring: [PendingClick; RING],
-    rn: usize,
-    rh: usize,
+struct ClickBatch {
+    batch: [PendingClick; BATCH],
+    bn: usize,
 }
 
-impl ClickRing {
-    #[inline(always)]
-    fn pop(&mut self, ctx: &Ctx, out: &mut ThreadOut) {
-        let e = self.ring[self.rh];
-        self.rh = (self.rh + 1) % RING;
-        self.rn -= 1;
-        let pid = ctx.ids.person(e.uhash, e.uref);
-        out.pc.push((pid >> ctx.pshift) as usize, CRec { pid, ts: e.ts, camp: e.camp, _pad: 0, kref: e.kref });
+impl ClickBatch {
+    #[inline(never)]
+    fn flush(&mut self, ctx: &Ctx, out: &mut ThreadOut) {
+        let n = self.bn;
+        self.bn = 0;
+        for i in 0..n {
+            let e = unsafe { *self.batch.get_unchecked(i) };
+            let pid = ctx.ids.person(e.uhash, e.uref);
+            out.pc.push((pid >> ctx.pshift) as usize, CRec { pid, ts: e.ts, camp: e.camp, _pad: 0, kref: e.kref });
+        }
     }
     #[inline(always)]
     fn push(&mut self, p: PendingClick, ctx: &Ctx, out: &mut ThreadOut) {
         unsafe {
             _mm_prefetch(ctx.ids.slot_ptr(p.uhash) as *const i8, _MM_HINT_T0);
+            *self.batch.get_unchecked_mut(self.bn) = p;
         }
-        if self.rn == RING {
-            self.pop(ctx, out);
+        self.bn += 1;
+        if self.bn == BATCH {
+            self.flush(ctx, out);
         }
-        let tail = (self.rh + self.rn) % RING;
-        self.ring[tail] = p;
-        self.rn += 1;
     }
 }
 
@@ -1612,15 +1612,13 @@ unsafe fn parse_events(ctx: &Ctx, chunk: &'static [u8], out: &mut ThreadOut) {
         out.push_pending(Pending { uhash, uref: mkref(fp[1], fl[1]), a: (ts - base) as u32, b: pc, c: rowid }, ctx);
     });
     out.flat = flat;
-    while out.rn > 0 {
-        out.pop_event(ctx);
-    }
+    out.flush_events(ctx);
 }
 
 unsafe fn parse_clicks(ctx: &Ctx, chunk: &'static [u8], out: &mut ThreadOut) {
     let lo = ctx.base;
     let we = ctx.we;
-    let mut ring = ClickRing { ring: [PendingClick::default(); RING], rn: 0, rh: 0 };
+    let mut ring = ClickBatch { batch: [PendingClick::default(); BATCH], bn: 0 };
     let mut flat = std::mem::replace(&mut out.flat, Flat::new());
     for_lines::<4>(&mut flat, chunk, |fp, fl| {
         if fl[0] == 0 || fl[1] == 0 {
@@ -1638,9 +1636,7 @@ unsafe fn parse_clicks(ctx: &Ctx, chunk: &'static [u8], out: &mut ThreadOut) {
         ring.push(PendingClick { uhash, uref: mkref(fp[1], fl[1]), kref: mkref(fp[0], fl[0]), ts: (ts - lo) as u32, camp }, ctx, out);
     });
     out.flat = flat;
-    while ring.rn > 0 {
-        ring.pop(ctx, out);
-    }
+    ring.flush(ctx, out);
 }
 
 // ---------------------------------------------------------------- output buffers
@@ -2169,9 +2165,8 @@ fn main() {
                         pc: Buckets::new(npb, per_cb),
                         rows: 0,
                         tid: t as u32,
-                        ring: [Pending::default(); RING],
-                        rn: 0,
-                        rh: 0,
+                        batch: [Pending::default(); BATCH],
+                        bn: 0,
                         flat: Flat::new(),
                     };
                     loop {
