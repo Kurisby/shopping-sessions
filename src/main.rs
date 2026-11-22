@@ -1220,7 +1220,16 @@ impl Name {
             }
         };
         self.w0.store(a, Relaxed);
-        self.w1.store(b, Relaxed);
+        // w1 is never 0 once set (IDs are not empty), so it doubles as the "ready" flag
+        self.w1.store(b, Release);
+    }
+    /// `get` for a name another thread may still be storing (its slot key is already visible).
+    #[inline(always)]
+    fn get_sync(&'static self) -> &'static [u8] {
+        while self.w1.load(Acquire) == 0 {
+            std::hint::spin_loop();
+        }
+        self.get()
     }
     #[inline(always)]
     fn is_long(&self) -> bool {
@@ -1328,8 +1337,11 @@ fn uf_find(parent: &[AtomicU32], mut x: u32) -> u32 {
     }
 }
 
+/// Joins the sets of a and b, always hanging the root with the byte-wise larger ID under
+/// the other: every parent's ID is smaller than its child's, so each root is its set's
+/// smallest ID (the person's representative) and no cycle can form.
 #[inline(always)]
-fn uf_union(parent: &[AtomicU32], a: u32, b: u32) {
+fn uf_union(ids: &Ids, parent: &[AtomicU32], a: u32, b: u32) {
     let (mut a, mut b) = (a, b);
     loop {
         a = uf_find(parent, a);
@@ -1337,7 +1349,9 @@ fn uf_union(parent: &[AtomicU32], a: u32, b: u32) {
         if a == b {
             return;
         }
-        let (hi, lo) = if a > b { (a, b) } else { (b, a) };
+        let na = ids.prefs[a as usize].get_sync();
+        let nb = ids.prefs[b as usize].get_sync();
+        let (hi, lo) = if na > nb { (a, b) } else { (b, a) };
         if parent[hi as usize].compare_exchange(0, lo + 1, AcqRel, Relaxed).is_ok() {
             return;
         }
@@ -1348,7 +1362,6 @@ fn uf_union(parent: &[AtomicU32], a: u32, b: u32) {
 fn build_links(ids: &Ids, link_chunks: &[&'static [u8]], nthreads: usize) {
     let cap = ids.mask + 1;
     let parent: &'static [AtomicU32] = zeroed::<AtomicU32>(cap);
-    let best: &'static [AtomicU32] = zeroed::<AtomicU32>(cap);
     let next = AtomicUsize::new(0);
     let mut inserted: Vec<Vec<u32>> = Vec::new();
     const LB: usize = 32;
@@ -1377,12 +1390,14 @@ fn build_links(ids: &Ids, link_chunks: &[&'static [u8]], nthreads: usize) {
                                 unsafe {
                                     _mm_prefetch(parent.as_ptr().add(a as usize) as *const i8, _MM_HINT_T0);
                                     _mm_prefetch(parent.as_ptr().add(b as usize) as *const i8, _MM_HINT_T0);
+                                    _mm_prefetch(ids.prefs.as_ptr().add(a as usize) as *const i8, _MM_HINT_T0);
+                                    _mm_prefetch(ids.prefs.as_ptr().add(b as usize) as *const i8, _MM_HINT_T0);
                                 }
                                 pairs.push((a, b));
                             }
                         }
                         for &(a, b) in pairs.iter() {
-                            uf_union(parent, a, b);
+                            uf_union(ids, parent, a, b);
                         }
                         batch.clear();
                     };
@@ -1419,42 +1434,7 @@ fn build_links(ids: &Ids, link_chunks: &[&'static [u8]], nthreads: usize) {
     if ids.overflow.load(Relaxed) {
         return;
     }
-    let name = |i: u32| ids.prefs[i as usize].get();
     const PD: usize = 8;
-    std::thread::scope(|s| {
-        for v in &inserted {
-            s.spawn(move || {
-                for (k, &i) in v.iter().enumerate() {
-                    if k + PD < v.len() {
-                        let j = v[k + PD] as usize;
-                        unsafe {
-                            _mm_prefetch(parent.as_ptr().add(j) as *const i8, _MM_HINT_T0);
-                            _mm_prefetch(ids.prefs.as_ptr().add(j) as *const i8, _MM_HINT_T0);
-                        }
-                    }
-                    if k + PD / 2 < v.len() {
-                        let e = &ids.prefs[v[k + PD / 2] as usize];
-                        if e.is_long() {
-                            unsafe {
-                                _mm_prefetch(e.ptr() as *const i8, _MM_HINT_T0);
-                            }
-                        }
-                    }
-                    let r = uf_find(parent, i) as usize;
-                    let my = name(i);
-                    loop {
-                        let cur = best[r].load(Relaxed);
-                        if cur != 0 && name(cur - 1) <= my {
-                            break;
-                        }
-                        if best[r].compare_exchange(cur, i + 1, Relaxed, Relaxed).is_ok() {
-                            break;
-                        }
-                    }
-                }
-            });
-        }
-    });
     std::thread::scope(|s| {
         for v in &inserted {
             s.spawn(move || {
@@ -1466,10 +1446,9 @@ fn build_links(ids: &Ids, link_chunks: &[&'static [u8]], nthreads: usize) {
                             _mm_prefetch(ids.slots.as_ptr().add(j) as *const i8, _MM_HINT_T0);
                         }
                     }
-                    let r = uf_find(parent, i) as usize;
-                    let b = best[r].load(Relaxed) - 1;
-                    if b != i {
-                        ids.slots[i as usize].rep.store(b + 1, Relaxed);
+                    let r = uf_find(parent, i);
+                    if r != i {
+                        ids.slots[i as usize].rep.store(r + 1, Relaxed);
                     }
                 }
             });
@@ -1554,6 +1533,9 @@ struct CRec {
     kref: u64,
 }
 
+static BMAX: AtomicU64 = AtomicU64::new(0);
+static BMAXJ: AtomicU64 = AtomicU64::new(0);
+
 struct Ctx {
     ws: i64,
     we: i64,
@@ -1569,7 +1551,7 @@ struct Ctx {
     pshift: u32,
 }
 
-const EB_BITS: u32 = 9;
+const EB_BITS: u32 = 11;
 const NEB: usize = 1 << EB_BITS;
 const NPB: usize = 512;
 const BATCH: usize = 64;
@@ -1794,23 +1776,61 @@ struct PersonWork {
     ccnt: Vec<u32>,
     ev: Vec<u64>,  // ts << 32 | pc, grouped by person
     ck: Vec<CKey>, // grouped by person
+    tmp_ev: Vec<u64>,
+    tmp_ck: Vec<CKey>,
 }
 
+/// Sorts by the key's high 32 bits (times; ties in any order are fine for every caller).
+/// Comparison sort for small slices, LSD radix (3 x 11 bits) for large ones (whales).
 #[inline(always)]
-fn sort_small<T: Copy>(v: &mut [T], key: impl Fn(&T) -> u64) {
+fn sort_small<T: Copy>(v: &mut [T], tmp: &mut Vec<T>, key: impl Fn(&T) -> u64) {
     if v.len() <= 1 {
-        for i in 1..v.len() {
-            let x = v[i];
-            let kx = key(&x);
-            let mut j = i;
-            while j > 0 && key(&v[j - 1]) > kx {
-                v[j] = v[j - 1];
-                j -= 1;
-            }
-            v[j] = x;
-        }
-    } else {
+        return;
+    }
+    if v.len() < RADIX_MIN {
         v.sort_unstable_by_key(|r| key(r));
+    } else {
+        radix_hi32(v, tmp, key);
+    }
+}
+
+const RADIX_MIN: usize = 2048;
+
+#[inline(never)]
+fn radix_hi32<T: Copy>(v: &mut [T], tmp: &mut Vec<T>, key: impl Fn(&T) -> u64) {
+    let n = v.len();
+    tmp.clear();
+    tmp.reserve(n);
+    unsafe { tmp.set_len(n) };
+    let mut h = vec![[0u32; 2048]; 3];
+    for x in v.iter() {
+        let k = (key(x) >> 32) as u32;
+        h[0][(k & 2047) as usize] += 1;
+        h[1][((k >> 11) & 2047) as usize] += 1;
+        h[2][(k >> 22) as usize] += 1;
+    }
+    for d in 0..3 {
+        let mut acc = 0u32;
+        for c in h[d].iter_mut() {
+            let x = *c;
+            *c = acc;
+            acc += x;
+        }
+    }
+    unsafe {
+        let (a, b) = (v.as_mut_ptr(), tmp.as_mut_ptr());
+        for (d, (src, dst)) in [(a, b), (b, a), (a, b)].into_iter().enumerate() {
+            let hd = &mut h[d];
+            let sh = 11 * d as u32;
+            for i in 0..n {
+                let x = *src.add(i);
+                let k = (((key(&x) >> 32) as u32) >> sh) & 2047;
+                let at = hd.get_unchecked_mut(k as usize);
+                *dst.add(*at as usize) = x;
+                *at += 1;
+            }
+        }
+        std::ptr::copy_nonoverlapping(b, a, n);
     }
 }
 
@@ -1931,9 +1951,9 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
         let ee = *w.cnt.get_unchecked(p) as usize;
         let cs = if p == 0 { 0 } else { *w.ccnt.get_unchecked(p - 1) as usize };
         let ce = *w.ccnt.get_unchecked(p) as usize;
-        sort_small(w.ev.get_unchecked_mut(es..ee), |&x| x);
+        sort_small(w.ev.get_unchecked_mut(es..ee), &mut w.tmp_ev, |&x| x);
         if ce - cs > 1 {
-            sort_small(w.ck.get_unchecked_mut(cs..ce), |c| c.key);
+            sort_small(w.ck.get_unchecked_mut(cs..ce), &mut w.tmp_ck, |c| c.key);
         }
         let evs = w.ev.get_unchecked(es..ee);
         let clicks = w.ck.get_unchecked(cs..ce);
@@ -2248,7 +2268,7 @@ fn main() {
         let ctx = Ctx { ws, we, base, products, campaigns, ncat: cat_names.len(), unknown_cat, ncamp, first_day, ndays, ids, pshift };
 
         // ---- phase 1: parse events and clicks
-        let per_eb = est_rows / (nthreads * NEB) * 3 / 2 + 256;
+        let per_eb = est_rows / (nthreads * NEB) * 3 / 2 + 64;
         let per_pb = est_rows / (nthreads * npb) * 3 / 2 + 256;
         let per_cb = est_ck / (nthreads * npb) * 3 / 2 + 256;
         let next = AtomicUsize::new(0);
@@ -2313,8 +2333,7 @@ fn main() {
                     let losers = &losers;
                     let next = &next;
                     s.spawn(move || {
-                        let mut keys: Vec<u64> = Vec::new();
-                        let mut vals: Vec<u64> = Vec::new();
+                        let mut tab: Vec<[u64; 2]> = Vec::new(); // (ehash, ingest << 32 | rowid)
                         let mut used: Vec<u32> = Vec::new();
                         let mark = |rowid: u32| {
                             let t = (rowid >> 27) as usize;
@@ -2329,10 +2348,9 @@ fn main() {
                             let total: usize = outs.iter().map(|o| o.dk.len(b)).sum();
                             let cap = (total * 2).next_power_of_two().max(16);
                             let mask = cap - 1;
-                            if keys.len() < cap {
+                            if tab.len() < cap {
                                 // grow (fresh zeroed memory); otherwise reuse: only used slots are dirty
-                                keys = vec![0; cap];
-                                vals = vec![0; cap];
+                                tab = vec![[0; 2]; cap];
                             }
                             used.clear();
                             for o in outs.iter() {
@@ -2341,19 +2359,17 @@ fn main() {
                                         let v = ((r.ingest as i64 - i32::MIN as i64) as u64) << 32 | r.rowid as u64;
                                         let mut p = (r.ehash as usize) & mask;
                                         loop {
-                                            let k = unsafe { *keys.get_unchecked(p) };
+                                            let e = unsafe { tab.get_unchecked_mut(p) };
+                                            let k = e[0];
                                             if k == 0 {
-                                                unsafe {
-                                                    *keys.get_unchecked_mut(p) = r.ehash;
-                                                    *vals.get_unchecked_mut(p) = v;
-                                                }
+                                                *e = [r.ehash, v];
                                                 used.push(p as u32);
                                                 break;
                                             }
                                             if k == r.ehash {
-                                                let old = vals[p];
+                                                let old = e[1];
                                                 if (v >> 32) < (old >> 32) {
-                                                    vals[p] = v;
+                                                    e[1] = v;
                                                     mark(old as u32);
                                                 } else {
                                                     mark(v as u32);
@@ -2367,7 +2383,7 @@ fn main() {
                             }
                             for &p in used.iter() {
                                 unsafe {
-                                    *keys.get_unchecked_mut(p as usize) = 0;
+                                    tab.get_unchecked_mut(p as usize)[0] = 0;
                                 }
                             }
                         }
@@ -2405,6 +2421,8 @@ fn main() {
                         ccnt: Vec::new(),
                         ev: Vec::new(),
                         ck: Vec::new(),
+                        tmp_ev: Vec::new(),
+                        tmp_ck: Vec::new(),
                     };
                     let mut ud = UserDaily::new(est_rows / 9 / nthreads + 1024);
                     loop {
@@ -2412,8 +2430,14 @@ fn main() {
                         if j >= npb {
                             break;
                         }
+                        let tb = Instant::now();
                         unsafe {
                             process_person_bucket(ctx, cat_names, outs, losers, order[j], &mut w, &mut ud);
+                        }
+                        let dt = tb.elapsed().as_micros() as u64;
+                        if dt > BMAX.load(Relaxed) {
+                            BMAX.store(dt, Relaxed);
+                            BMAXJ.store(j as u64, Relaxed);
                         }
                     }
                     let cc: Vec<[i64; 4]> = w.credited.iter().zip(w.assisted.iter()).map(|(c, &a)| [c[0], c[1], c[2], a as i64]).collect();
@@ -2425,6 +2449,10 @@ fn main() {
             }
         });
         lap("sessions");
+        if verbose {
+            let j = BMAXJ.load(Relaxed) as usize;
+            eprintln!("  max bucket {} us (rank {j}, {} events); top sizes {:?}", BMAX.load(Relaxed), sizes[order[j]], (0..6).map(|k| sizes[order[k]]).collect::<Vec<_>>());
+        }
         if verbose { eprintln!("  person: events {:.1} clicks {:.1} walk {:.1} (thread-ms)", TM[0].load(Relaxed) as f64/1e6, TM[1].load(Relaxed) as f64/1e6, TM[2].load(Relaxed) as f64/1e6); }
 
         // ---- phase 4: write outputs
