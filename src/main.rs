@@ -1184,12 +1184,9 @@ fn read_small_csv(path: &Path) -> Vec<(&'static [u8], &'static [u8])> {
 
 // ---------------------------------------------------------------- user IDs: one lock-free table for every ID
 
-#[repr(C, align(16))]
-struct Slot {
-    key: AtomicU64,
-    rep: AtomicU32, // 0 = this slot is its own person, else representative slot + 1
-    _pad: u32,
-}
+/// One ID-table slot: the ID hash's fingerprint above `rb` bits of representative
+/// (0 = the slot is its own person, else representative slot + 1); 0 = empty.
+type Slot = AtomicU64;
 
 /// An ID's bytes: up to 15 inline (bytes 0..15, length in byte 15),
 /// else a ref (ptr | len << 48) in w0 and 0xFF in byte 15.
@@ -1257,6 +1254,8 @@ struct Ids {
     prefs: &'static [Name], // the ID's bytes
     cap: u64, // home slots are 0..cap
     n: usize, // slots, including IDS_PAD past cap
+    rb: u32,  // representative bits at the bottom of a slot
+    fpmask: u64,
     overflow: AtomicBool,
 }
 
@@ -1266,7 +1265,10 @@ impl Ids {
         // probes run past the home range into IDS_PAD spare slots instead of wrapping
         let cap = cap.max(1024);
         let n = cap + IDS_PAD;
+        let rb = (usize::BITS - (n + 1).leading_zeros()).max(24);
         Ids {
+            rb,
+            fpmask: u64::MAX >> rb,
             slots: zeroed::<Slot>(n),
             prefs: zeroed::<Name>(n),
             cap: cap as u64,
@@ -1282,26 +1284,29 @@ impl Ids {
     fn slot_ptr(&self, h: u64) -> *const Slot {
         unsafe { self.slots.as_ptr().add(self.home(h)) }
     }
-    /// Slot of the ID, inserting it when new. Returns (slot, inserted).
+    /// Slot of the ID, inserting it when new. Returns (slot, inserted, representative field).
     #[inline(always)]
-    fn intern(&self, h: u64, r: u64) -> (u32, bool) {
+    fn intern(&self, h: u64, r: u64) -> (u32, bool, u32) {
+        let fp = h & self.fpmask;
+        let want = (if fp == 0 { 1 } else { fp }) << self.rb;
+        let rmask = (1u64 << self.rb) - 1;
         let mut i = self.home(h);
         let mut probes = 0u32;
         loop {
             let s = unsafe { self.slots.get_unchecked(i) };
-            let k = s.key.load(Relaxed);
-            if k == h {
-                return (i as u32, false);
+            let k = s.load(Relaxed);
+            if k & !rmask == want {
+                return (i as u32, false, (k & rmask) as u32);
             }
             if k == 0 {
-                match s.key.compare_exchange(0, h, Relaxed, Relaxed) {
+                match s.compare_exchange(0, want, Relaxed, Relaxed) {
                     Ok(_) => {
                         unsafe { self.prefs.get_unchecked(i) }.set(r);
-                        return (i as u32, true);
+                        return (i as u32, true, 0);
                     }
                     Err(k2) => {
-                        if k2 == h {
-                            return (i as u32, false);
+                        if k2 & !rmask == want {
+                            return (i as u32, false, (k2 & rmask) as u32);
                         }
                     }
                 }
@@ -1309,7 +1314,7 @@ impl Ids {
             probes += 1;
             if probes > 512 {
                 self.overflow.store(true, Relaxed);
-                return (0, false);
+                return (0, false, 0);
             }
             i += 1;
         }
@@ -1317,16 +1322,16 @@ impl Ids {
     /// Person (representative slot) of an ID seen in events or clicks.
     #[inline(always)]
     fn person(&self, h: u64, r: u64) -> u32 {
-        let (i, ins) = self.intern(h, r);
-        if ins {
-            return i;
-        }
-        let rep = unsafe { self.slots.get_unchecked(i as usize) }.rep.load(Relaxed);
+        let (i, _, rep) = self.intern(h, r);
         if rep == 0 {
             i
         } else {
             rep - 1
         }
+    }
+    /// Records the representative of a linked ID (links phase, after all inserts).
+    fn set_rep(&self, i: u32, r: u32) {
+        self.slots[i as usize].fetch_or((r + 1) as u64, Relaxed);
     }
 }
 
@@ -1387,8 +1392,8 @@ fn build_links(ids: &Ids, link_chunks: &[&'static [u8]], nthreads: usize) {
                     let mut flush = |batch: &mut Vec<(u64, u64, u64, u64)>, mine: &mut Vec<u32>| {
                         pairs.clear();
                         for &(ha, ra, hb, rb) in batch.iter() {
-                            let (a, ia) = ids.intern(ha, ra);
-                            let (b, ib) = ids.intern(hb, rb);
+                            let (a, ia, _) = ids.intern(ha, ra);
+                            let (b, ib, _) = ids.intern(hb, rb);
                             if ia {
                                 mine.push(a);
                             }
@@ -1457,7 +1462,7 @@ fn build_links(ids: &Ids, link_chunks: &[&'static [u8]], nthreads: usize) {
                     }
                     let r = uf_find(parent, i);
                     if r != i {
-                        ids.slots[i as usize].rep.store(r + 1, Relaxed);
+                        ids.set_rep(i, r);
                     }
                 }
             });
