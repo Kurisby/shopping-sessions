@@ -2426,11 +2426,15 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
         put_str(&mut ud.names, name);
         ud.nnames += 1;
         if nc == 0 {
-            walk_person::<0>(ctx, w, ud, evs, cs, ce, cat_names);
+            walk_person::<0, 0>(ctx, w, ud, evs, cs, ce, cat_names);
         } else if nc <= 8 && ctx.vec_window {
-            walk_person::<1>(ctx, w, ud, evs, cs, ce, cat_names);
+            walk_person::<1, 1>(ctx, w, ud, evs, cs, ce, cat_names);
+        } else if nc <= 16 && ctx.vec_window {
+            walk_person::<1, 2>(ctx, w, ud, evs, cs, ce, cat_names);
+        } else if nc <= 32 && ctx.vec_window {
+            walk_person::<1, 4>(ctx, w, ud, evs, cs, ce, cat_names);
         } else {
-            walk_person::<2>(ctx, w, ud, evs, cs, ce, cat_names);
+            walk_person::<2, 0>(ctx, w, ud, evs, cs, ce, cat_names);
         }
     }
     TM[2].fetch_add(tq.elapsed().as_nanos() as u64, Relaxed);
@@ -2438,12 +2442,12 @@ unsafe fn process_person_bucket(ctx: &Ctx, cat_names: &[Vec<u8>], outs: &[Thread
 
 /// One person's walk over their sorted events: sessions (a gap over 30 minutes starts one),
 /// per-day totals, last-touch credit and assisted counts. Clicks are w.ck[cs..ce], sorted.
-/// MODE 0: no clicks. MODE 1: 1..=8 clicks, the 7-day window of each session found with one
-/// vector compare (no branch per click). MODE 2: more clicks, a sliding window with lazy
+/// MODE 0: no clicks. MODE 1: 1..=8G clicks, the 7-day window of each session found with G
+/// vector compares (no branch per click). MODE 2: more clicks, a sliding window with lazy
 /// assisted counts (an active campaign c owes `sc - since[c]` sessions to the current day,
 /// paid when it leaves the window, the day changes or the person ends).
 #[inline(always)]
-unsafe fn walk_person<const MODE: u8>(ctx: &Ctx, w: &mut PersonWork, ud: &mut UserDaily, evs: &[u64], cs: usize, ce: usize, cat_names: &[Vec<u8>]) {
+unsafe fn walk_person<const MODE: u8, const G: usize>(ctx: &Ctx, w: &mut PersonWork, ud: &mut UserDaily, evs: &[u64], cs: usize, ce: usize, cat_names: &[Vec<u8>]) {
     let base = ctx.base;
     let ndays = ctx.ndays;
     let organic = ctx.ncamp;
@@ -2464,36 +2468,43 @@ unsafe fn walk_person<const MODE: u8>(ctx: &Ctx, w: &mut PersonWork, ud: &mut Us
         let mut bw = 0u64;
         let mut pbits = 0u64;
         let mut i = 0usize;
-        while i < n {
-            let (cur, prv) = if i + 4 <= n && i > 0 {
-                (_mm256_loadu_si256(ep.add(i) as *const __m256i), _mm256_loadu_si256(ep.add(i - 1) as *const __m256i))
-            } else {
-                // first or last group: masked loads (lanes past n read as 0: no break, no purchase)
-                let lane = _mm256_setr_epi64x(0, 1, 2, 3);
-                let lim = _mm256_set1_epi64x((n - i) as i64);
-                let lm = _mm256_cmpgt_epi64(lim, lane);
-                let cur = _mm256_maskload_epi64(ep.add(i) as *const i64, lm);
-                let prv = if i == 0 {
-                    _mm256_permute4x64_epi64::<0b10_01_00_00>(cur)
-                } else {
-                    _mm256_maskload_epi64(ep.add(i - 1) as *const i64, lm)
-                };
-                (cur, prv)
-            };
+        // one group: 4 session-start bits and 4 purchase bits; a finished word is stored
+        let mut step = |cur: __m256i, prv: __m256i, i: usize| {
             let d = _mm256_sub_epi64(_mm256_srli_epi64::<32>(cur), _mm256_srli_epi64::<32>(prv));
             let b4 = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpgt_epi64(d, gap))) as u64;
             let np4 = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_cmpeq_epi64(_mm256_and_si256(cur, pmask), zero))) as u64;
             bw |= b4 << (i & 63);
             pbits |= (np4 ^ 0xF) << (i & 63);
-            i += 4;
-            if (i & 63) == 0 || i >= n {
-                *bp.add((i - 1) >> 6) = bw;
-                *pw.add((i - 1) >> 6) = pbits;
+            if ((i + 4) & 63) == 0 {
+                *bp.add(i >> 6) = bw;
+                *pw.add(i >> 6) = pbits;
                 bw = 0;
                 pbits = 0;
             }
+        };
+        // first and last groups take masked loads (lanes past n read as 0: no break, no purchase)
+        let lane = _mm256_setr_epi64x(0, 1, 2, 3);
+        {
+            let lm = _mm256_cmpgt_epi64(_mm256_set1_epi64x(n as i64), lane);
+            let cur = _mm256_maskload_epi64(ep as *const i64, lm);
+            step(cur, _mm256_permute4x64_epi64::<0b10_01_00_00>(cur), 0);
+            i += 4;
         }
-        // (i - 1) >> 6 reached n >> 6 unless n is a multiple of 64: then its word is new
+        while i + 4 <= n {
+            step(_mm256_loadu_si256(ep.add(i) as *const __m256i), _mm256_loadu_si256(ep.add(i - 1) as *const __m256i), i);
+            i += 4;
+        }
+        if i < n {
+            let lm = _mm256_cmpgt_epi64(_mm256_set1_epi64x((n - i) as i64), lane);
+            step(_mm256_maskload_epi64(ep.add(i) as *const i64, lm), _mm256_maskload_epi64(ep.add(i - 1) as *const i64, lm), i);
+            i += 4;
+        }
+        // the last, partial word (i >> 6 is then n >> 6)
+        if (i & 63) != 0 {
+            *bp.add(i >> 6) = bw;
+            *pw.add(i >> 6) = pbits;
+        }
+        // n >> 6 was stored unless n is a multiple of 64: then its word is new
         if n & 63 == 0 {
             *bp.add(n >> 6) = 0;
             *pw.add(n >> 6) = 0;
@@ -2501,12 +2512,12 @@ unsafe fn walk_person<const MODE: u8>(ctx: &Ctx, w: &mut PersonWork, ud: &mut Us
         *bp.add(n >> 6) |= 1u64 << (n & 63);
         *pw.add(n >> 6) |= 1u64 << (n & 63);
     }
-    // MODE 1: clicks as 8 vector lanes
-    let mut tsv = _mm256_setzero_si256();
-    let mut cmv = _mm256_setzero_si256();
-    let mut campa = [organic as u32; 8];
-    let mut lt = [organic as u32; 9];
-    let mut cntv = _mm256_setzero_si256();
+    // MODE 1: clicks as 8G vector lanes
+    let mut tsv = [_mm256_setzero_si256(); 4];
+    let mut cmv = [_mm256_setzero_si256(); 4];
+    let mut campa = [organic as u32; 32];
+    let mut lt = [organic as u32; 33];
+    let mut cntv = [_mm256_setzero_si256(); 4];
     let nc = ce - cs;
     if MODE == 1 {
         let ck = w.ck.get_unchecked_mut(cs..ce);
@@ -2519,26 +2530,29 @@ unsafe fn walk_person<const MODE: u8>(ctx: &Ctx, w: &mut PersonWork, ud: &mut Us
                 j -= 1;
             }
         }
-        let mut tsa = [i32::MAX; 8];
+        let mut tsa = [i32::MAX; 32];
         for i in 0..nc {
             tsa[i] = (ck.get_unchecked(i).key >> 32) as i32;
             campa[i] = ck.get_unchecked(i).key as u32;
-        }
-        // lane i (the first click of its campaign) gets the mask of that campaign's clicks
-        let mut cma = [0u32; 8];
-        for i in 0..nc {
-            let mut eq = 0u32;
-            for j in 0..nc {
-                eq |= ((campa[j] == campa[i]) as u32) << j;
-            }
-            let first = eq.trailing_zeros() as usize == i;
-            cma[i] = eq & 0u32.wrapping_sub(first as u32);
-        }
-        for i in 0..nc {
             lt[i + 1] = campa[i];
         }
-        tsv = _mm256_loadu_si256(tsa.as_ptr() as *const __m256i);
-        cmv = _mm256_loadu_si256(cma.as_ptr() as *const __m256i);
+        // lane f (the first click of its campaign) gets the mask of that campaign's clicks;
+        // wcnt (zero between persons) holds each campaign's first lane + 1 meanwhile
+        let mut cma = [0u32; 32];
+        for i in 0..nc {
+            let c = campa[i] as usize;
+            let f = *w.wcnt.get_unchecked(c);
+            let f = if f == 0 { i as u32 + 1 } else { f };
+            *w.wcnt.get_unchecked_mut(c) = f;
+            cma[(f - 1) as usize] |= 1u32 << i;
+        }
+        for i in 0..nc {
+            *w.wcnt.get_unchecked_mut(campa[i] as usize) = 0;
+        }
+        for g in 0..G {
+            tsv[g] = _mm256_loadu_si256(tsa.as_ptr().add(8 * g) as *const __m256i);
+            cmv[g] = _mm256_loadu_si256(cma.as_ptr().add(8 * g) as *const __m256i);
+        }
     }
     let clicks = w.ck.get_unchecked(cs..ce);
     let ones = _mm256_set1_epi32(-1);
@@ -2574,12 +2588,14 @@ unsafe fn walk_person<const MODE: u8>(ctx: &Ctx, w: &mut PersonWork, ud: &mut Us
                 flush_day(ud, (cur_day - ctx.first_day) as u32, d_sessions, d_events, d_rev, d_purch, &mut w.cat_sum, cat_names);
                 let od = (cur_day - ctx.first_day) as usize;
                 if MODE == 1 {
-                    let mut cnt = [0u32; 8];
-                    _mm256_storeu_si256(cnt.as_mut_ptr() as *mut __m256i, cntv);
+                    let mut cnt = [0u32; 32];
+                    for g in 0..G {
+                        _mm256_storeu_si256(cnt.as_mut_ptr().add(8 * g) as *mut __m256i, cntv[g]);
+                        cntv[g] = _mm256_setzero_si256();
+                    }
                     for i in 0..nc {
                         *w.assisted.get_unchecked_mut(campa[i] as usize * ndays + od) += cnt[i];
                     }
-                    cntv = _mm256_setzero_si256();
                 } else if MODE == 2 {
                     for &c in w.active.iter() {
                         let c = c as usize;
@@ -2616,14 +2632,19 @@ unsafe fn walk_person<const MODE: u8>(ctx: &Ctx, w: &mut PersonWork, ud: &mut Us
             organic
         } else if MODE == 1 {
             // in window: start - 7d <= ts <= start (padding lanes hold i32::MAX: never)
-            let out = _mm256_or_si256(
-                _mm256_cmpgt_epi32(tsv, _mm256_set1_epi32(start as i32)),
-                _mm256_cmpgt_epi32(_mm256_set1_epi32((start - WEEK as u32) as i32), tsv),
-            );
-            let inw = !(_mm256_movemask_ps(_mm256_castsi256_ps(out)) as u32) & 0xFF;
+            let sv = _mm256_set1_epi32(start as i32);
+            let lv = _mm256_set1_epi32((start - WEEK as u32) as i32);
+            let mut inw = 0u32;
+            for g in 0..G {
+                let out = _mm256_or_si256(_mm256_cmpgt_epi32(tsv[g], sv), _mm256_cmpgt_epi32(lv, tsv[g]));
+                inw |= (!(_mm256_movemask_ps(_mm256_castsi256_ps(out)) as u32) & 0xFF) << (8 * g);
+            }
             // campaigns with a click in the window: one more session each
-            let inact = _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_set1_epi32(inw as i32), cmv), _mm256_setzero_si256());
-            cntv = _mm256_sub_epi32(cntv, _mm256_andnot_si256(inact, ones));
+            let iv = _mm256_set1_epi32(inw as i32);
+            for g in 0..G {
+                let inact = _mm256_cmpeq_epi32(_mm256_and_si256(iv, cmv[g]), _mm256_setzero_si256());
+                cntv[g] = _mm256_sub_epi32(cntv[g], _mm256_andnot_si256(inact, ones));
+            }
             // the last in-window click's campaign (lt[0]: organic, when none is in it)
             *lt.get_unchecked((32 - inw.leading_zeros()) as usize) as usize
         } else {
@@ -2680,8 +2701,10 @@ unsafe fn walk_person<const MODE: u8>(ctx: &Ctx, w: &mut PersonWork, ud: &mut Us
     }
     let ld = (cur_day - ctx.first_day) as usize;
     if MODE == 1 {
-        let mut cnt = [0u32; 8];
-        _mm256_storeu_si256(cnt.as_mut_ptr() as *mut __m256i, cntv);
+        let mut cnt = [0u32; 32];
+        for g in 0..G {
+            _mm256_storeu_si256(cnt.as_mut_ptr().add(8 * g) as *mut __m256i, cntv[g]);
+        }
         for i in 0..nc {
             *w.assisted.get_unchecked_mut(campa[i] as usize * ndays + ld) += cnt[i];
         }
