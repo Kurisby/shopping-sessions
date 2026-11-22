@@ -1067,7 +1067,9 @@ unsafe fn for_lines<const N: usize>(flat: &mut Flat, chunk: &'static [u8], mut f
                 ls = last + 1;
                 j += N;
                 let mut slow = false;
-                if q != 0 {
+                // most lines have quotes, so the check runs on every line: a branch on q would
+                // mispredict about one line in four, and the check costs less than that
+                {
                     if last - lsl < 250 {
                         // quote bits of the line's 256 bytes from lsl, as 8 x 32-bit words
                         let qp = flat.qm.as_ptr().add((lsl >> 6) as usize) as *const __m256i;
@@ -1335,6 +1337,11 @@ impl Ids {
             overflow: AtomicBool::new(false),
         }
     }
+    /// The name entry of slot group `h`'s first slot (the group's names share a line).
+    #[inline(always)]
+    fn name_ptr(&self, h: u64) -> *const Name {
+        unsafe { self.prefs.as_ptr().add((h as usize) & self.mask & !3) }
+    }
     #[inline(always)]
     fn slot_ptr(&self, h: u64) -> *const Slot {
         unsafe { self.slots.as_ptr().add((h as usize) & self.mask) }
@@ -1439,6 +1446,7 @@ fn uf_union(ids: &Ids, parent: &[AtomicU32], a: u32, b: u32) {
 
 /// Joins linked IDs; every linked ID's slot gets its representative (byte-wise smallest ID).
 fn build_links(ids: &Ids, link_chunks: &[&'static [u8]], nthreads: usize) {
+    let tb0 = Instant::now();
     let cap = ids.mask + 1;
     let parent: &'static [AtomicU32] = zeroed::<AtomicU32>(cap);
     let next = AtomicUsize::new(0);
@@ -1494,6 +1502,13 @@ fn build_links(ids: &Ids, link_chunks: &[&'static [u8]], nthreads: usize) {
                                 let hb = hash_ptr(fp[1], fl[1]);
                                 _mm_prefetch(ids.slot_ptr(ha) as *const i8, _MM_HINT_T0);
                                 _mm_prefetch(ids.slot_ptr(hb) as *const i8, _MM_HINT_T0);
+                                // and the names of the slots' groups (one line per group of 4):
+                                // a new ID's name store then hits, so the slot CAS (a locked
+                                // instruction, which waits for every earlier store) waits on nothing
+                                if PF_NAMES {
+                                    _mm_prefetch(ids.name_ptr(ha) as *const i8, _MM_HINT_ET0);
+                                    _mm_prefetch(ids.name_ptr(hb) as *const i8, _MM_HINT_ET0);
+                                }
                                 batch.push((ha, mkref(fp[0], fl[0]), hb, mkref(fp[1], fl[1])));
                                 if batch.len() == LB {
                                     flush(&mut batch, &mut mine);
@@ -1512,6 +1527,9 @@ fn build_links(ids: &Ids, link_chunks: &[&'static [u8]], nthreads: usize) {
     });
     if ids.overflow.load(Relaxed) {
         return;
+    }
+    if std::env::var("SS_VERBOSE").is_ok() {
+        eprintln!("  links pass 1 {:.1} ms: {} inserted", tb0.elapsed().as_secs_f64() * 1e3, inserted.iter().map(|v| v.len()).sum::<usize>());
     }
     const PD: usize = 8;
     std::thread::scope(|s| {
@@ -1645,6 +1663,7 @@ struct CRec {
 }
 
 const LPD: usize = 24;
+const PF_NAMES: bool = true;
 static BMAX: AtomicU64 = AtomicU64::new(0);
 static BMAXJ: AtomicU64 = AtomicU64::new(0);
 
@@ -1843,6 +1862,9 @@ unsafe fn parse_events(ctx: &Ctx, chunk: &'static [u8], out: &mut ThreadOut) {
     // second (it is when the manifest's window bounds are ISO timestamps)
     let base_secs = base.div_euclid(1000);
     let zfast = base.rem_euclid(1000) == 0;
+    // fast-path ingest seconds (years 2000..2063) minus base_secs fit an i32 below i32::MAX
+    // without clamping when base is in 2000..2034
+    let noclamp = zfast & (946_684_800..946_684_800 + (1 << 30)).contains(&base_secs);
     let mut flat = std::mem::replace(&mut out.flat, Flat::new());
     for_lines::<7>(&mut flat, chunk, |fp, fl| {
         if fl[0] == 0 {
@@ -1850,7 +1872,10 @@ unsafe fn parse_events(ctx: &Ctx, chunk: &'static [u8], out: &mut ThreadOut) {
         }
         let ehash = hash_ptr(fp[0], fl[0]);
         // ingest_ts: always the `Z` form in practice, parsed straight to seconds
-        let (ingest, ingest_rel) = if zfast & (fl[3] == 20) {
+        let fsecs = if noclamp & (fl[3] == 20) { iso_secs::<false>(fp[3]) } else { u64::MAX };
+        let (ingest, ingest_rel) = if fsecs != u64::MAX {
+            (fsecs as i64 * 1000, (fsecs as i64 - base_secs) as i32)
+        } else if zfast & (fl[3] == 20) {
             let secs = parse_z_secs(fp[3]);
             if secs == BAD_TS {
                 (BAD_TS, i32::MAX)
@@ -2518,8 +2543,12 @@ fn main() {
         // ID table sized for linked IDs plus the users seen only in events
         // ~26-byte link lines, each ID in ~1.5 of them; plus users seen only in events
         let est_ids = link_bytes / 20 + est_rows / 60 + 4096;
+        let tl = Instant::now();
         let ids = Ids::new(est_ids * 3 / 2 * grow);
         build_links(&ids, &link_chunks, nthreads);
+        if verbose {
+            eprintln!("  build_links {:.1} ms ({} slots)", tl.elapsed().as_secs_f64() * 1e3, ids.mask + 1);
+        }
         if let Some(h) = pc_handle.take() {
             let r = h.join().unwrap();
             cat_names = r.0;
